@@ -23,6 +23,13 @@ from PyQt5.QtGui import *
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.ico'}
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v', '.mpg', '.mpeg', '.3gp', '.webm'}
 ALL_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS  # 合并图片和视频扩展名
+# 窗口布局持久化键名
+KEY_THUMB_SIZE = "thumb_size"
+KEY_SPLITTER_SIZES = "splitter_sizes"
+
+def normalize_path(path: str) -> str:
+    """将路径中的正斜杠统一替换为反斜杠（Windows UNC 路径格式）"""
+    return path.replace('/', '\\') if path else path
 
 # 自动确定存储路径 (AppData/PixClass/config.json)
 if sys.platform == "win32":
@@ -73,7 +80,7 @@ PANEL_COLOR    = QColor(26, 26, 32)       # 面板背景色
 CARD_COLOR     = QColor(36, 36, 44)       # 卡片背景色
 CARD_HOVER     = QColor(99, 179, 237, 60) # 卡片悬停色
 ACCENT_COLOR   = QColor(99, 179, 237)     # 主强调色
-ACCENT2_COLOR  = QColor(154, 117, 234)    # 次强调色
+ACCENT2_COLOR  = QColor(86, 98, 209)    # 次强调色
 TEXT_PRIMARY   = QColor(230, 230, 240)    # 主要文字色
 TEXT_SECONDARY = QColor(140, 140, 160)    # 次要文字色
 DROP_HIGHLIGHT = QColor(99, 179, 237, 80) # 拖拽高亮色
@@ -131,47 +138,41 @@ class VideoThumbnailLoader(QThread):
             self.thumbnail_ready.emit(self.path, placeholder)
     
     def _extract_thumbnail(self) -> QPixmap:
-        """提取视频缩略图"""
-        # 方法1：尝试使用 OpenCV
+        """提取视频中间帧作为缩略图"""
         try:
             import cv2
             cap = cv2.VideoCapture(self.path)
             if cap.isOpened():
-                # 读取第一帧
-                ret, frame = cap.read()
-                if ret:
-                    # 转换颜色空间 BGR -> RGB
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    h, w, ch = frame.shape
-                    bytes_per_line = ch * w
-                    qimage = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                    scaled = qimage.scaled(self.size, self.size,
-                                          Qt.KeepAspectRatio,
-                                          Qt.SmoothTransformation)
-                    cap.release()
-                    return QPixmap.fromImage(scaled)
+                # 获取视频总帧数
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                
+                if total_frames > 0:
+                    # 提取中间帧（1/5 处，避免开头的黑屏或过暗帧）
+                    mid_frame = total_frames // 5
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
+                    ret, frame = cap.read()
+                    
+                    if ret:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        h, w, ch = frame.shape
+                        bytes_per_line = ch * w
+                        qimage = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                        scaled = qimage.scaled(self.size, self.size,
+                                            Qt.KeepAspectRatio,
+                                            Qt.SmoothTransformation)
+                        cap.release()
+                        return QPixmap.fromImage(scaled)
+                else:
+                    # 无法获取帧数，回退到第一帧
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
+                    if ret:
+                        # ... 处理同上
+                        pass
             cap.release()
-        except ImportError:
-            pass  # OpenCV 未安装
-        
-        # 方法2：尝试使用 PyAV
-        # try:
-        #     import av
-        #     container = av.open(self.path)
-        #     for frame in container.decode(video=0):
-        #         img = frame.to_image()
-        #         img = img.convert('RGB')
-        #         # 转换为 QImage
-        #         data = img.tobytes('raw', 'RGB')
-        #         qimage = QImage(data, img.width, img.height, QImage.Format_RGB888)
-        #         scaled = qimage.scaled(self.size, self.size,
-        #                               Qt.KeepAspectRatio,
-        #                               Qt.SmoothTransformation)
-        #         return QPixmap.fromImage(scaled)
         except ImportError:
             pass
         
-        # 如果无法提取，返回视频占位图
         return self._make_video_placeholder()
     
     def _make_video_placeholder(self) -> QPixmap:
@@ -233,20 +234,21 @@ class FolderThumbnailLoader(QThread):
     def run(self):
         try:
             s = self.size
+            cover_size = int(s * 0.58)
             
-            # 使用 QImageReader 读取封面，自动应用 EXIF 方向
-            reader = QImageReader(self.cover_path)
-            reader.setAutoTransform(True)
-            img = reader.read()
+            # 判断封面文件类型
+            ext = Path(self.cover_path).suffix.lower()
             
-            if img.isNull():
+            if ext in VIDEO_EXTENSIONS:
+                # 如果是视频，使用视频缩略图加载器
+                cover_px = self._load_video_thumbnail(cover_size)
+            else:
+                # 图片则正常加载
+                cover_px = self._load_image_thumbnail(cover_size)
+            
+            if cover_px is None or cover_px.isNull():
                 self.thumbnail_ready.emit(self.folder_path, self.base_px)
                 return
-
-            cover_size = int(s * 0.58)
-            scaled = img.scaled(cover_size, cover_size,
-                                Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            cover_px = QPixmap.fromImage(scaled)
 
             result = self.base_px.copy()
             p = QPainter(result)
@@ -265,17 +267,151 @@ class FolderThumbnailLoader(QThread):
         except Exception:
             self.thumbnail_ready.emit(self.folder_path, self.base_px)
 
+    def _scale_and_crop_image(self, source_image, cover_size: int) -> QPixmap:
+        """统一的缩放裁剪逻辑：放大填充后居中裁剪"""
+        iw, ih = source_image.width(), source_image.height()
+        if iw > 0 and ih > 0:
+            # 放大填充：计算缩放比例，使图片完全覆盖 cover_size×cover_size
+            scale = max(cover_size / iw, cover_size / ih)
+            scaled_w = int(iw * scale)
+            scaled_h = int(ih * scale)
+            
+            # 缩放到覆盖尺寸
+            scaled_img = source_image.scaled(scaled_w, scaled_h,
+                                            Qt.IgnoreAspectRatio, 
+                                            Qt.SmoothTransformation)
+            
+            # 居中裁剪
+            crop_x = (scaled_w - cover_size) // 2
+            crop_y = (scaled_h - cover_size) // 2
+            cropped = scaled_img.copy(crop_x, crop_y, cover_size, cover_size)
+            
+            return QPixmap.fromImage(cropped)
+        return QPixmap()
 
+    def _load_image_thumbnail(self, cover_size: int) -> Optional[QPixmap]:
+        """加载图片缩略图"""
+        try:
+            reader = QImageReader(self.cover_path)
+            reader.setAutoTransform(True)
+            img = reader.read()
+            
+            if img.isNull():
+                return None
+
+            return self._scale_and_crop_image(img, cover_size)
+        except Exception:
+            pass
+        return None
+
+    def _load_video_thumbnail(self, cover_size: int) -> Optional[QPixmap]:
+        """加载视频缩略图，使用 1/5 处帧"""
+        try:
+            import cv2
+            
+            cap = cv2.VideoCapture(self.cover_path)
+            if not cap.isOpened():
+                cap.release()
+                return self._make_video_placeholder(cover_size)
+            
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            if total_frames > 0:
+                target_frame = total_frames // 5
+                if target_frame < 1:
+                    target_frame = 1
+                
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ret, frame = cap.read()
+                
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    for i in range(target_frame):
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                
+                if ret and frame is not None and frame.size > 0:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w, ch = frame_rgb.shape
+                    bytes_per_line = ch * w
+                    qimage = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                    cap.release()
+                    return self._scale_and_crop_image(qimage, cover_size)
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w, ch = frame_rgb.shape
+                    bytes_per_line = ch * w
+                    qimage = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                    cap.release()
+                    return self._scale_and_crop_image(qimage, cover_size)
+                    
+            cap.release()
+            
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        
+        return self._make_video_placeholder(cover_size)
+
+    def _make_video_placeholder(self, size: int) -> QPixmap:
+        """创建视频文件占位图"""
+        px = QPixmap(size, size)
+        px.fill(Qt.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing)
+        
+        # 背景
+        p.setBrush(QBrush(QColor(50, 50, 65)))
+        p.setPen(Qt.NoPen)
+        path = QPainterPath()
+        path.addRoundedRect(2, 2, size - 4, size - 4, 4, 4)
+        p.drawPath(path)
+        
+        # 电影胶片图标
+        p.setPen(QPen(QColor(100, 100, 120), 1.0))
+        film_x = size // 4
+        film_y = size // 3
+        film_w = size // 2
+        film_h = size // 3
+        p.drawRoundedRect(film_x, film_y, film_w, film_h, 3, 3)
+        
+        # 绘制胶片孔
+        hole_size = max(2, size // 20)
+        for i in range(3):
+            p.drawEllipse(film_x + 5 + i * (film_w - 10) // 2, 
+                         film_y + 5, hole_size, hole_size)
+            p.drawEllipse(film_x + 5 + i * (film_w - 10) // 2,
+                         film_y + film_h - 8, hole_size, hole_size)
+        
+        # 播放按钮
+        p.setBrush(QBrush(QColor(200, 200, 220, 180)))
+        p.drawEllipse(size // 2 - 10, size // 2 - 10, 20, 20)
+        p.setBrush(QBrush(QColor(50, 50, 65)))
+        triangle = [
+            QPoint(size // 2 - 3, size // 2 - 5),
+            QPoint(size // 2 - 3, size // 2 + 5),
+            QPoint(size // 2 + 5, size // 2)
+        ]
+        p.drawPolygon(triangle)
+        
+        p.end()
+        return px
+    
 # ─────────────────────────────────────────────
 #  文件/文件夹数据项类
 # ─────────────────────────────────────────────
 class FileItem:
     def __init__(self, path: str, is_dir: bool):
-        self.path = path              # 完整路径
-        self.name = os.path.basename(path)  # 文件名/文件夹名
-        self.is_dir = is_dir          # 是否为文件夹
-        self.thumbnail: Optional[QPixmap] = None  # 缩略图
-        self.loading = False          # 是否正在加载缩略图
+        self.path = normalize_path(path)
+        self.name = os.path.basename(self.path)
+        self.is_dir = is_dir
+        self.thumbnail: Optional[QPixmap] = None
+        self.loading = False
 
     def is_image(self) -> bool:
         # 判断是否为支持的媒体文件（图片或视频）
@@ -294,7 +430,7 @@ class OrderManager:
     _cached_data = None 
 
     def __init__(self, folder_path: str):
-        self.folder_path = os.path.abspath(folder_path)
+        self.folder_path = normalize_path(os.path.abspath(folder_path))
         if OrderManager._cached_data is None:
             self._load_all()
 
@@ -305,7 +441,7 @@ class OrderManager:
         save_global_setting("folder_metadata", OrderManager._cached_data)
 
     def add_image(self, filename: str):
-        """记录图片顺序（用于封面选择）"""
+        """记录媒体文件顺序（用于封面选择）"""
         if self.folder_path not in OrderManager._cached_data:
             OrderManager._cached_data[self.folder_path] = []
         
@@ -313,22 +449,77 @@ class OrderManager:
             OrderManager._cached_data[self.folder_path].append(filename)
             self._save_all()
 
+    def remove_image(self, filename: str):
+        """移除文件记录"""
+        if self.folder_path in OrderManager._cached_data:
+            if filename in OrderManager._cached_data[self.folder_path]:
+                OrderManager._cached_data[self.folder_path].remove(filename)
+                self._save_all()
+
+    def clear_records(self):
+        """清除该文件夹的所有记录"""
+        if self.folder_path in OrderManager._cached_data:
+            OrderManager._cached_data[self.folder_path] = []
+            self._save_all()
+
+    def sync_with_filesystem(self):
+        """同步记录与实际文件系统：移除不存在的文件记录"""
+        if self.folder_path not in OrderManager._cached_data:
+            return
+        
+        valid_records = []
+        for filename in OrderManager._cached_data[self.folder_path]:
+            full_path = os.path.join(self.folder_path, filename)
+            if os.path.exists(full_path):
+                valid_records.append(filename)
+        
+        if len(valid_records) != len(OrderManager._cached_data[self.folder_path]):
+            OrderManager._cached_data[self.folder_path] = valid_records
+            self._save_all()
+
     def get_cover(self) -> Optional[str]:
-        """获取封面：先找记录，再找物理文件"""
+        """
+        获取封面：先找记录中的媒体文件，再找物理文件
+        支持图片和视频作为封面
+        """
+        # 先同步记录，移除不存在的文件
+        self.sync_with_filesystem()
+        
         folder_data = OrderManager._cached_data.get(self.folder_path, [])
+        
+        # 1. 优先从历史记录中查找存在的媒体文件
         for name in folder_data:
             full = os.path.join(self.folder_path, name)
             if os.path.exists(full):
-                return full
+                ext = Path(full).suffix.lower()
+                if ext in ALL_MEDIA_EXTENSIONS:
+                    return full
         
-        # 兜底逻辑
+        # 2. 兜底逻辑：扫描文件夹
         try:
             if os.path.exists(self.folder_path):
-                files = sorted(os.listdir(self.folder_path))
-                for f in files:
-                    if Path(f).suffix.lower() in IMAGE_EXTENSIONS:
-                        return os.path.join(self.folder_path, f)
-        except: pass
+                image_files = []
+                video_files = []
+                
+                with os.scandir(self.folder_path) as it:
+                    for entry in it:
+                        if entry.is_file() and not entry.name.startswith('.'):
+                            ext = Path(entry.name).suffix.lower()
+                            if ext in IMAGE_EXTENSIONS:
+                                image_files.append(entry.path)
+                            elif ext in VIDEO_EXTENSIONS:
+                                video_files.append(entry.path)
+                
+                if image_files:
+                    image_files.sort()
+                    return image_files[0]
+                elif video_files:
+                    video_files.sort()
+                    return video_files[0]
+                    
+        except Exception:
+            pass
+            
         return None
 
     def remove_image(self, filename: str):
@@ -337,6 +528,16 @@ class OrderManager:
                 OrderManager._cached_data[self.folder_path].remove(filename)
                 self._save_all()
 
+    def get_current_cover(self) -> Optional[str]:
+        """获取当前有效的封面（不触发同步）"""
+        folder_data = OrderManager._cached_data.get(self.folder_path, [])
+        for name in folder_data:
+            full = os.path.join(self.folder_path, name)
+            if os.path.exists(full):
+                ext = Path(full).suffix.lower()
+                if ext in ALL_MEDIA_EXTENSIONS:
+                    return full
+        return None
 # ─────────────────────────────────────────────
 #  操作历史：支持撤销 / 重做文件移动
 # ─────────────────────────────────────────────
@@ -347,15 +548,29 @@ class MoveRecord:
         self.moves = moves
 
 
+class CopyRecord:
+    """记录一次批量复制操作（撤销时删除已复制的文件）"""
+    def __init__(self, copies: list[tuple[str, str]]):
+        # copies: [(原src, 已复制到的dst), ...]  撤销时删除 dst
+        self.copies = copies
+
+class PasteRecord:
+    """记录一次粘贴操作（支持撤销/重做）"""
+    def __init__(self, copies: list[tuple[str, str]], is_cut: bool):
+        # copies: [(src_path, dst_path), ...] 粘贴操作创建的每个文件
+        # is_cut: True=剪切粘贴, False=复制粘贴
+        self.copies = copies
+        self.is_cut = is_cut
+
 class ActionHistory:
-    """轻量撤销/重做栈，只跟踪文件移动操作"""
+    """轻量撤销/重做栈，跟踪文件移动和粘贴操作"""
     MAX_DEPTH = 50  # 最多保留 50 步历史
 
     def __init__(self):
-        self._undo_stack: list[MoveRecord] = []
-        self._redo_stack: list[MoveRecord] = []
+        self._undo_stack: list = []  # 可以存储 MoveRecord 或 PasteRecord
+        self._redo_stack: list = []
 
-    def push(self, record: MoveRecord):
+    def push(self, record):
         """记录一步操作，清空 redo 栈"""
         self._undo_stack.append(record)
         if len(self._undo_stack) > self.MAX_DEPTH:
@@ -368,14 +583,14 @@ class ActionHistory:
     def can_redo(self) -> bool:
         return bool(self._redo_stack)
 
-    def pop_undo(self) -> Optional[MoveRecord]:
+    def pop_undo(self):
         if self._undo_stack:
             rec = self._undo_stack.pop()
             self._redo_stack.append(rec)
             return rec
         return None
 
-    def pop_redo(self) -> Optional[MoveRecord]:
+    def pop_redo(self):
         if self._redo_stack:
             rec = self._redo_stack.pop()
             self._undo_stack.append(rec)
@@ -390,19 +605,76 @@ class ActionHistory:
 # ─────────────────────────────────────────────
 #  文件列表数据模型
 # ─────────────────────────────────────────────
+
+class ScannerThread(QThread):
+    """后台扫描线程，用于流式发现文件"""
+    item_found = pyqtSignal(object)  # 信号：发现一个 FileItem
+    finished = pyqtSignal()         # 信号：扫描完成
+
+    def __init__(self, folder_path, dirs_only=False, files_only=False):
+        super().__init__()
+        self.folder_path = folder_path
+        self.dirs_only = dirs_only
+        self.files_only = files_only
+        self._is_running = True
+
+    def stop(self):
+        self._is_running = False
+
+    def run(self):
+        try:
+            # 使用 os.scandir 提高遍历效率
+            with os.scandir(self.folder_path) as it:
+                # 为了保持基本的视觉顺序，先读取并排序
+                entries = sorted(list(it), key=lambda e: e.name.lower())
+                
+                for entry in entries:
+                    if not self._is_running:
+                        break
+                    
+                    # 过滤逻辑
+                    if entry.name.startswith('.') or entry.name.startswith('_imgclass'):
+                        continue
+                        
+                    try:
+                        item = None
+                        if entry.is_dir():
+                            if not self.files_only:
+                                item = FileItem(entry.path, True)
+                        else:
+                            if not self.dirs_only:
+                                ext = Path(entry.name).suffix.lower()
+                                if ext in ALL_MEDIA_EXTENSIONS:
+                                    item = FileItem(entry.path, False)
+                        
+                        if item:
+                            # 关键：通过信号发送给 Model
+                            self.item_found.emit(item)
+                            # 极其微小的延迟可以让 UI 刷新更平滑，不至于瞬间阻塞主线程
+                            self.msleep(1) 
+                            
+                    except OSError:
+                        continue
+        except Exception as e:
+            print(f"扫描出错: {e}")
+        
+        self.finished.emit()
+
 class FileListModel(QAbstractListModel):
-    ITEM_ROLE = Qt.UserRole + 1  # 自定义数据角色
+    ITEM_ROLE = Qt.UserRole + 1
+    scan_finished = pyqtSignal()
+    first_item_found = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.items: list[FileItem] = []  # 数据项列表
+        self.items: list[FileItem] = []
+        self._scanner: Optional[ScannerThread] = None
+        self._first_item_emitted = False
 
     def rowCount(self, parent=QModelIndex()):
-        # 返回列表项数量
         return len(self.items)
 
     def data(self, index, role=Qt.DisplayRole):
-        # 获取指定索引的数据
         if not index.isValid() or index.row() >= len(self.items):
             return QVariant()
         item = self.items[index.row()]
@@ -413,26 +685,22 @@ class FileListModel(QAbstractListModel):
         return QVariant()
 
     def flags(self, index):
-        # 设置项的交互属性
         base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
         if index.isValid():
             item = self.items[index.row()]
             if item.is_image():
-                base |= Qt.ItemIsDragEnabled  # 图片可拖拽
+                base |= Qt.ItemIsDragEnabled
             if item.is_dir:
-                base |= Qt.ItemIsDropEnabled  # 文件夹可接收拖拽
+                base |= Qt.ItemIsDropEnabled
         return base
 
     def supportedDropActions(self):
-        # 支持移动操作
         return Qt.MoveAction
 
     def mimeTypes(self):
-        # 自定义拖拽数据类型
         return ['application/x-imgclassifier-items']
 
     def mimeData(self, indexes):
-        # 生成拖拽数据
         paths = []
         for idx in indexes:
             item = self.items[idx.row()]
@@ -443,51 +711,116 @@ class FileListModel(QAbstractListModel):
                      '\n'.join(paths).encode('utf-8'))
         return mime
 
-    def load_folder(self, folder_path: str, dirs_only: bool = False, files_only: bool = False):
-        # 加载文件夹内容到模型（dirs_only=True 只加目录，files_only=True 只加文件）
+    def load_folder_sync(self, folder_path: str, dirs_only: bool = False, files_only: bool = False):
+        """同步加载文件夹（用于导航时快速刷新）"""
+        # 1. 停止之前的扫描任务
+        if self._scanner and self._scanner.isRunning():
+            self._scanner.stop()
+            self._scanner.wait()
+            self._scanner = None
+
+        # 2. 一次性清空并加载所有项目
         self.beginResetModel()
         self.items.clear()
         
         try:
+            # 直接同步遍历文件夹
+            items_to_add = []
             with os.scandir(folder_path) as it:
-                dirs = []
-                images = []
-                
                 for entry in it:
-                    # 过滤隐藏文件和配置文件
                     if entry.name.startswith('.') or entry.name.startswith('_imgclass'):
                         continue
-                        
+                    
                     try:
+                        item = None
                         if entry.is_dir():
                             if not files_only:
-                                dirs.append(FileItem(entry.path, True))
+                                item = FileItem(entry.path, True)
                         else:
                             if not dirs_only:
                                 ext = Path(entry.name).suffix.lower()
                                 if ext in ALL_MEDIA_EXTENSIONS:
-                                    images.append(FileItem(entry.path, False))
+                                    item = FileItem(entry.path, False)
+                        
+                        if item:
+                            items_to_add.append(item)
                     except OSError:
                         continue
-        except (PermissionError, FileNotFoundError):
-            self.endResetModel()
-            return
-
-        # 排序
-        dirs.sort(key=lambda x: x.name.lower())
-        images.sort(key=lambda x: x.name.lower())
+            
+            # 排序：文件夹在前，按名称排序
+            dirs = [item for item in items_to_add if item.is_dir]
+            files = [item for item in items_to_add if not item.is_dir]
+            dirs.sort(key=lambda x: x.name.lower())
+            files.sort(key=lambda x: x.name.lower())
+            
+            self.items = dirs + files
+            
+        except Exception as e:
+            print(f"同步扫描出错: {e}")
+            
+        self.endResetModel()
         
-        self.items = dirs + images
+        # 发射信号
+        self.first_item_found.emit()
+        self.scan_finished.emit()
+
+    def load_folder_async(self, folder_path: str, dirs_only: bool = False, files_only: bool = False):
+        """异步流式加载文件夹（用于初始打开大文件夹）"""
+        # 1. 停止之前的扫描任务
+        if self._scanner and self._scanner.isRunning():
+            self._scanner.stop()
+            self._scanner.wait()
+
+        # 2. 清空当前视图
+        self.beginResetModel()
+        self.items.clear()
         self.endResetModel()
 
-    def get_item(self, index: QModelIndex) -> Optional[FileItem]:
-        # 根据索引获取数据项
+        # 重置首次发射标记
+        self._first_item_emitted = False
+
+        # 3. 创建并启动扫描线程
+        self._scanner = ScannerThread(folder_path, dirs_only, files_only)
+        self._scanner.item_found.connect(self._handle_item_found)
+        self._scanner.finished.connect(self.scan_finished.emit)
+        self._scanner.start()
+
+    # --- 流式加载核心逻辑 ---
+    def load_folder(self, folder_path: str, dirs_only: bool = False, files_only: bool = False):
+        """默认使用异步流式加载（保持向后兼容）"""
+        self.load_folder_async(folder_path, dirs_only, files_only)
+
+    def _handle_item_found(self, item: 'FileItem'):
+        """处理线程发回的每一个项"""
+        insert_idx = len(self.items)
+        if item.is_dir:
+            for i, existing in enumerate(self.items):
+                if not existing.is_dir or existing.name.lower() > item.name.lower():
+                    insert_idx = i
+                    break
+        else:
+            for i, existing in enumerate(self.items):
+                if not existing.is_dir and existing.name.lower() > item.name.lower():
+                    insert_idx = i
+                    break
+
+        self.beginInsertRows(QModelIndex(), insert_idx, insert_idx)
+        self.items.insert(insert_idx, item)
+        self.endInsertRows()
+
+        # 如果是第一个项目，发射信号
+        if not self._first_item_emitted:
+            self._first_item_emitted = True
+            self.first_item_found.emit()
+
+    # --- 其他辅助方法 ---
+
+    def get_item(self, index: QModelIndex) -> Optional['FileItem']:
         if index.isValid() and 0 <= index.row() < len(self.items):
             return self.items[index.row()]
         return None
 
     def refresh_item(self, path: str):
-        # 刷新指定路径的项
         for i, item in enumerate(self.items):
             if item.path == path:
                 item.thumbnail = None
@@ -496,7 +829,6 @@ class FileListModel(QAbstractListModel):
                 break
 
     def remove_item(self, path: str):
-        # 移除指定路径的项
         for i, item in enumerate(self.items):
             if item.path == path:
                 self.beginRemoveRows(QModelIndex(), i, i)
@@ -517,10 +849,13 @@ class FileItemDelegate(QStyledItemDelegate):
         self._loaders: list[QThread] = []            # 所有加载线程列表
         self._loading_folders: set[str] = set()      # 正在加载封面的文件夹路径
         self._drop_target: Optional[str] = None      # 拖拽目标文件夹路径
-        self._placeholder_folder = self._make_folder_icon()    # 文件夹默认图标
-        self._placeholder_image = self._make_image_placeholder()# 图片默认占位图
+        
+        # 固定使用最大尺寸生成所有占位图
+        self._placeholder_folder = self._make_folder_icon_at_size(MAX_THUMB_SIZE)
+        self._placeholder_image = self._make_image_placeholder_at_size(MAX_THUMB_SIZE)
+        self._placeholder_video = self._make_video_placeholder_at_size(MAX_THUMB_SIZE)
 
-        # 定期清理已结束的线程（避免在 paint() 中清理，减少每帧开销）
+        # 定期清理已结束的线程
         self._cleanup_timer = QTimer()
         self._cleanup_timer.setInterval(2000)
         self._cleanup_timer.timeout.connect(self._cleanup_loaders)
@@ -530,27 +865,22 @@ class FileItemDelegate(QStyledItemDelegate):
         self._loaders = [l for l in self._loaders if l.isRunning()]
 
     def set_drop_target(self, path: Optional[str]):
-        # 设置拖拽高亮目标
         self._drop_target = path
 
     def set_thumb_size(self, size: int):
-        # 设置缩略图尺寸，清空缓存
+        """设置缩略图显示尺寸，占位图始终使用最大尺寸，无需重新生成"""
         self.thumb_size = size
-        self._thumb_cache.clear()
-        self._loading_folders.clear()
-        self._placeholder_folder = self._make_folder_icon()
-        self._placeholder_image = self._make_image_placeholder()
+        # 占位图不需要重新生成，因为总是最大尺寸，绘制时会自动缩放
 
     def invalidate_cache(self, path: str):
-        # 失效指定路径的缓存（包含 folder: 和 cover: 前缀的 key）
+        """失效指定路径的缓存"""
         keys = [k for k in self._thumb_cache if path in k]
         for k in keys:
             del self._thumb_cache[k]
         self._loading_folders.discard(path)
 
-    def _make_folder_icon(self) -> QPixmap:
-        # 绘制文件夹默认图标
-        s = self.thumb_size
+    def _make_folder_icon_at_size(self, s: int) -> QPixmap:
+        """按指定尺寸绘制文件夹图标"""
         px = QPixmap(s, s)
         px.fill(Qt.transparent)
         p = QPainter(px)
@@ -595,9 +925,8 @@ class FileItemDelegate(QStyledItemDelegate):
         p.end()
         return px
 
-    def _make_image_placeholder(self) -> QPixmap:
-        # 绘制图片默认占位图
-        s = self.thumb_size
+    def _make_image_placeholder_at_size(self, s: int) -> QPixmap:
+        """按指定尺寸绘制图片占位图"""
         px = QPixmap(s, s)
         px.fill(Qt.transparent)
         p = QPainter(px)
@@ -627,34 +956,89 @@ class FileItemDelegate(QStyledItemDelegate):
         p.end()
         return px
 
+    def _make_video_placeholder_at_size(self, s: int) -> QPixmap:
+        """按指定尺寸绘制视频占位图"""
+        px = QPixmap(s, s)
+        px.fill(Qt.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing)
+        
+        # 背景
+        p.setBrush(QBrush(QColor(50, 50, 65)))
+        p.setPen(Qt.NoPen)
+        path = QPainterPath()
+        path.addRoundedRect(2, 2, s - 4, s - 4, 8, 8)
+        p.drawPath(path)
+        
+        # 电影胶片图标
+        p.setPen(QPen(QColor(100, 100, 120), 1.5))
+        film_x = s // 4
+        film_y = s // 3
+        film_w = s // 2
+        film_h = s // 3
+        p.drawRoundedRect(film_x, film_y, film_w, film_h, 4, 4)
+        
+        # 绘制胶片孔
+        hole_size = max(2, s // 20)
+        for i in range(3):
+            p.drawEllipse(film_x + 5 + i * (film_w - 10) // 2, 
+                         film_y + 5, hole_size, hole_size)
+            p.drawEllipse(film_x + 5 + i * (film_w - 10) // 2,
+                         film_y + film_h - 8, hole_size, hole_size)
+        
+        # 播放按钮
+        p.setBrush(QBrush(QColor(200, 200, 220, 180)))
+        p.drawEllipse(s // 2 - 12, s // 2 - 12, 24, 24)
+        p.setBrush(QBrush(QColor(50, 50, 65)))
+        triangle = [
+            QPoint(s // 2 - 3, s // 2 - 6),
+            QPoint(s // 2 - 3, s // 2 + 6),
+            QPoint(s // 2 + 6, s // 2)
+        ]
+        p.drawPolygon(triangle)
+        
+        p.end()
+        return px
+
+    def _make_folder_icon(self) -> QPixmap:
+        """兼容旧接口，返回最大尺寸的文件夹图标"""
+        return self._placeholder_folder
+
+    def _make_image_placeholder(self) -> QPixmap:
+        """兼容旧接口，返回最大尺寸的图片占位图"""
+        return self._placeholder_image
+
     def _build_folder_thumbnail(self, item: FileItem, index: QModelIndex) -> QPixmap:
-        """获取文件夹缩略图（异步加载封面，首次返回占位图）"""
-        cache_key = f"folder:{item.path}:{self.thumb_size}"
+        """获取文件夹缩略图"""
+        cache_key = f"folder:{item.path}"
+        
+        # 检查缓存
         if cache_key in self._thumb_cache:
-            return self._thumb_cache[cache_key]
+            cached = self._thumb_cache[cache_key]
+            return self._scale_pixmap(cached)
 
-        # 已在加载中，直接返回基底占位图
+        # 已在加载中，返回占位图
         if item.path in self._loading_folders:
-            return self._placeholder_folder
+            return self._scale_pixmap(self._placeholder_folder)
 
-        base = self._placeholder_folder.copy()
+        # 获取封面路径
         om = OrderManager(item.path)
         cover_path = om.get_cover()
 
         if not cover_path:
-            # 无封面，直接缓存并返回
-            self._thumb_cache[cache_key] = base
-            return base
+            # 无封面：缓存最大尺寸占位图
+            self._thumb_cache[cache_key] = self._placeholder_folder
+            return self._scale_pixmap(self._placeholder_folder)
 
         # 启动后台线程异步加载封面
         item.loading = True
         self._loading_folders.add(item.path)
-        loader = FolderThumbnailLoader(item.path, cover_path, self.thumb_size, base)
+        loader = FolderThumbnailLoader(item.path, cover_path, MAX_THUMB_SIZE, self._placeholder_folder)
 
         def on_folder_ready(folder_path, px):
-            self._thumb_cache[f"folder:{folder_path}:{self.thumb_size}"] = px
+            self._thumb_cache[f"folder:{folder_path}"] = px
             self._loading_folders.discard(folder_path)
-            # 找到该文件夹对应的 item，清除 loading 标志并通知刷新
+            # 更新模型
             for i, it in enumerate(self.model.items):
                 if it.path == folder_path:
                     it.loading = False
@@ -666,24 +1050,26 @@ class FileItemDelegate(QStyledItemDelegate):
         loader.start()
         self._loaders.append(loader)
 
-        return base
+        return self._scale_pixmap(self._placeholder_folder)
 
     def _get_media_thumbnail(self, item: FileItem, index: QModelIndex) -> QPixmap:
-        """获取媒体文件缩略图（图片或视频）"""
-        cache_key = f"media:{item.path}:{self.thumb_size}"
+        """获取媒体文件缩略图"""
+        cache_key = f"media:{item.path}"
+
         if cache_key in self._thumb_cache:
-            return self._thumb_cache[cache_key]
+            return self._scale_pixmap(self._thumb_cache[cache_key])
 
         if not item.loading:
             item.loading = True
-            
+
+            # 始终按最大尺寸加载
             if item.is_video():
-                loader = VideoThumbnailLoader(item.path, self.thumb_size)
+                loader = VideoThumbnailLoader(item.path, MAX_THUMB_SIZE)
             else:
-                loader = ThumbnailLoader(item.path, self.thumb_size)
+                loader = ThumbnailLoader(item.path, MAX_THUMB_SIZE)
 
             def on_ready(path, px):
-                self._thumb_cache[f"media:{path}:{self.thumb_size}"] = px
+                self._thumb_cache[f"media:{path}"] = px
                 item.loading = False
                 if index.isValid():
                     model = index.model()
@@ -693,10 +1079,17 @@ class FileItemDelegate(QStyledItemDelegate):
             loader.thumbnail_ready.connect(on_ready)
             loader.start()
             self._loaders.append(loader)
-            # 线程清理由 _cleanup_timer 统一处理，不在此处执行
 
-        return self._placeholder_image
+        return self._scale_pixmap(self._placeholder_image)
 
+    def _scale_pixmap(self, pixmap: QPixmap) -> QPixmap:
+        """将高分辨率图片缩放到当前显示尺寸"""
+        if pixmap.width() == self.thumb_size and pixmap.height() == self.thumb_size:
+            return pixmap
+        return pixmap.scaled(self.thumb_size, self.thumb_size,
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation)
+    
     def sizeHint(self, option, index):
         # 项尺寸
         cell = self.thumb_size + 40
@@ -787,24 +1180,6 @@ class FileItemDelegate(QStyledItemDelegate):
         elided = fm.elidedText(name, Qt.ElideMiddle, label_rect.width() - 6)
         painter.drawText(label_rect, Qt.AlignCenter | Qt.AlignVCenter, elided)
 
-        # 拖拽指示箭头
-        # if is_hovered:
-        #     arrow_size = 24
-        #     ax = card_rect.center().x() - arrow_size // 2
-        #     ay = card_rect.center().y() - arrow_size // 2
-        #     painter.setPen(QPen(DROP_BORDER, 2))
-        #     painter.setBrush(QBrush(QColor(99, 179, 237, 200)))
-        #     painter.drawEllipse(ax, ay, arrow_size, arrow_size)
-        #     painter.setPen(QPen(Qt.white, 2))
-        #     # 向下箭头
-        #     cx2 = ax + arrow_size // 2
-        #     painter.drawLine(cx2, ay + 5, cx2, ay + arrow_size - 7)
-        #     pts = [QPoint(cx2 - 5, ay + arrow_size - 10),
-        #            QPoint(cx2, ay + arrow_size - 5),
-        #            QPoint(cx2 + 5, ay + arrow_size - 10)]
-        #     for i in range(len(pts) - 1):
-        #         painter.drawLine(pts[i], pts[i + 1])
-
         painter.restore()
 
 
@@ -815,6 +1190,14 @@ class ImageGridView(QListView):
     folder_entered = pyqtSignal(str)          # 进入文件夹信号
     image_opened = pyqtSignal(str)            # 打开图片信号
     items_moved = pyqtSignal(list, str)       # 图片移动信号(路径列表,目标文件夹)
+    items_copied = pyqtSignal(list, str)      # 图片复制信号(路径列表,目标文件夹) ← 新增
+    cut_requested = pyqtSignal(list)          # 剪切信号(路径列表)
+    copy_requested = pyqtSignal(list)         # 复制信号(路径列表)
+    paste_requested = pyqtSignal()            # 粘贴信号
+    new_folder_requested = pyqtSignal()       # 新建文件夹信号
+    rename_requested = pyqtSignal(str)        # 重命名信号(路径)
+    is_folder_panel: bool = False             # 标记是否为右侧文件夹面板
+    thumb_size_changed = pyqtSignal(int)      # 缩略图大小变化信号
 
     def __init__(self, model: FileListModel, delegate: FileItemDelegate, parent=None):
         super().__init__(parent)
@@ -839,6 +1222,11 @@ class ImageGridView(QListView):
         self._drag_start: Optional[QPoint] = None
         self._drop_index: Optional[QModelIndex] = None
 
+        # 橡皮筋多选相关
+        self._rubber_band: Optional[QRubberBand] = None
+        self._rubber_origin: Optional[QPoint] = None
+        self._rubber_selecting: bool = False
+
         # 界面样式
         self.setStyleSheet(f"""
             QListView {{
@@ -860,25 +1248,92 @@ class ImageGridView(QListView):
                 border-radius: 4px;
                 min-height: 30px;
             }}
+            QScrollBar::handle:vertical:hover {{
+                background: #777788;
+            }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                background: none;
                 height: 0px;
+                border: none;
+                subcontrol-origin: margin;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: none;
             }}
             QScrollBar:horizontal {{
                 background: {PANEL_COLOR.name()};
                 height: 8px;
+                border-radius: 4px;
             }}
             QScrollBar::handle:horizontal {{
                 background: #555566;
                 border-radius: 4px;
+                min-width: 30px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background: #777788;
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                background: none;
+                width: 0px;
+                border: none;
+                subcontrol-origin: margin;
+            }}
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+                background: none;
             }}
         """)
 
     def update_thumb_size(self, size: int):
-        # 更新缩略图尺寸
+        """更新缩略图尺寸（实时）"""
         self.file_delegate.set_thumb_size(size)
         cell = size + 40
         self.setGridSize(QSize(cell, cell))
-        self.scheduleDelayedItemsLayout()
+        # 强制立即重新布局，不需要延迟
+        self.doItemsLayout()
+        self.viewport().update()
+
+    def wheelEvent(self, event):
+        """处理 Ctrl+滚轮调整缩略图大小"""
+        if event.modifiers() & Qt.ControlModifier:
+            # 计算新的缩略图大小
+            delta = event.angleDelta().y()
+            if delta > 0:
+                new_size = min(MAX_THUMB_SIZE, self.file_delegate.thumb_size + 10)
+            else:
+                new_size = max(MIN_THUMB_SIZE, self.file_delegate.thumb_size - 10)
+            
+            if new_size != self.file_delegate.thumb_size:
+                self.thumb_size_changed.emit(new_size)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def mousePressEvent(self, event):
+        """鼠标点击时自动获取焦点"""
+        # 先设置焦点
+        self.setFocus()
+        
+        if event.button() == Qt.LeftButton:
+            if self._is_blank_area(event.pos()):
+                # 点击空白区域：开始橡皮筋框选
+                self._rubber_origin = event.pos()
+                self._rubber_selecting = True
+                self._drag_start = None
+                if self._rubber_band is None:
+                    self._rubber_band = QRubberBand(QRubberBand.Rectangle, self.viewport())
+                self._rubber_band.setGeometry(QRect(self._rubber_origin, QSize()))
+                self._rubber_band.show()
+                # 清除已有选中（除非按住 Ctrl/Shift）
+                if not (event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)):
+                    self.clearSelection()
+            else:
+                # 点击了图片：记录拖拽起始
+                self._rubber_selecting = False
+                self._drag_start = event.pos()
+                super().mousePressEvent(event)
+        else:
+            super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         # 双击事件：进入文件夹/打开图片
@@ -892,13 +1347,67 @@ class ImageGridView(QListView):
                     self.image_opened.emit(item.path)
         super().mouseDoubleClickEvent(event)
 
+    def _is_blank_area(self, pos: QPoint) -> bool:
+        """判断坐标是否处于空白区域（图片与图片之间的间隔，或无图片的空白）"""
+        index = self.indexAt(pos)
+        return not index.isValid()
+
     def mousePressEvent(self, event):
-        # 记录拖拽起始位置
         if event.button() == Qt.LeftButton:
-            self._drag_start = event.pos()
-        super().mousePressEvent(event)
+            if self._is_blank_area(event.pos()):
+                # 点击空白区域：开始橡皮筋框选
+                self._rubber_origin = event.pos()
+                self._rubber_selecting = True
+                self._drag_start = None
+                if self._rubber_band is None:
+                    self._rubber_band = QRubberBand(QRubberBand.Rectangle, self.viewport())
+                self._rubber_band.setGeometry(QRect(self._rubber_origin, QSize()))
+                self._rubber_band.show()
+                # 清除已有选中（除非按住 Ctrl/Shift）
+                if not (event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)):
+                    self.clearSelection()
+            else:
+                # 点击了图片：记录拖拽起始
+                self._rubber_selecting = False
+                self._drag_start = event.pos()
+                super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # 橡皮筋框选中
+        if self._rubber_selecting and self._rubber_origin is not None:
+            rect = QRect(self._rubber_origin, event.pos()).normalized()
+            self._rubber_band.setGeometry(rect)
+            # 根据框选矩形更新选中项
+            scroll_rect = QRect(
+                rect.x() + self.horizontalScrollBar().value(),
+                rect.y() + self.verticalScrollBar().value(),
+                rect.width(), rect.height()
+            )
+            sel = QItemSelection()
+            for i in range(self.file_model.rowCount()):
+                idx = self.file_model.index(i)
+                item: FileItem = idx.data(FileListModel.ITEM_ROLE)
+                
+                # 根据面板类型决定选择什么
+                if self.is_folder_panel:
+                    # 右侧栏：只选择文件夹
+                    if not item or not item.is_dir:
+                        continue
+                else:
+                    # 左侧栏：只选择图片/视频文件
+                    if not item or item.is_dir:
+                        continue
+                        
+                vr = self.visualRect(idx)
+                if vr.intersects(rect):
+                    sel.select(idx, idx)
+            
+            mode = QItemSelectionModel.ClearAndSelect if not (
+                event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
+            ) else QItemSelectionModel.Select
+            self.selectionModel().select(sel, mode)
+            return
+
         # 处理拖拽操作
         if (event.buttons() & Qt.LeftButton and
                 self._drag_start and
@@ -908,25 +1417,36 @@ class ImageGridView(QListView):
             drag_items = []
             for idx in selected:
                 item: FileItem = idx.data(FileListModel.ITEM_ROLE)
-                if item and item.is_image():
-                    drag_items.append(item)
+                if item:
+                    # 根据面板类型决定可以拖拽什么
+                    if self.is_folder_panel:
+                        # 右侧栏：可以拖拽文件夹（虽然实际很少用）
+                        if item.is_dir:
+                            drag_items.append(item)
+                    else:
+                        # 左侧栏：只能拖拽图片/视频
+                        if item.is_image():
+                            drag_items.append(item)
 
             if drag_items:
-                # ==============================================
-                # 【修复】先创建拖拽对象 → 强制设置 mimeData
-                # ==============================================
                 drag = QDrag(self)
                 
-                # 强制生成拖拽数据（必须在 exec_ 之前设置）
+                # 强制生成拖拽数据
                 paths = [i.path for i in drag_items]
                 mime = QMimeData()
                 mime.setData('application/x-imgclassifier-items',
                             '\n'.join(paths).encode('utf-8'))
-                drag.setMimeData(mime)  # 关键修复：确保设置 mimeData
+                drag.setMimeData(mime)
 
-                # 拖拽图标：第一张图片缩略图
+                # 拖拽图标
                 first = drag_items[0]
-                px = self.file_delegate._get_media_thumbnail(first, selected[0])
+                if first.is_dir:
+                    # 文件夹使用文件夹图标
+                    px = self.file_delegate._build_folder_thumbnail(first, selected[0])
+                else:
+                    # 文件使用缩略图
+                    px = self.file_delegate._get_media_thumbnail(first, selected[0])
+                    
                 if px and not px.isNull():
                     scaled = px.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     badge = QPixmap(scaled.width() + 4, scaled.height() + 4)
@@ -965,6 +1485,15 @@ class ImageGridView(QListView):
         self.file_delegate.set_drop_target(None)
         self.viewport().update()
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._rubber_selecting:
+            self._rubber_selecting = False
+            if self._rubber_band:
+                self._rubber_band.hide()
+            self._rubber_origin = None
+            return
+        super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event):
         # 拖拽进入：验证数据类型
@@ -1024,6 +1553,77 @@ class ImageGridView(QListView):
             event.ignore()
 
         self.viewport().update()
+
+    def contextMenuEvent(self, event):
+        """右键菜单：有选中项时显示剪切/复制/新建，空白处显示新建/粘贴"""
+        index = self.indexAt(event.pos())
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: #1e1e28;
+                color: #e6e6f0;
+                border: 1px solid #3a3a50;
+                border-radius: 6px;
+                padding: 4px 0;
+                font-size: 13px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            }}
+            QMenu::item {{
+                padding: 6px 20px 6px 12px;
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background: rgba(99,179,237,30);
+                color: {ACCENT_COLOR.name()};
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: #2a2a36;
+                margin: 3px 8px;
+            }}
+        """)
+
+        selected_indexes = self.selectedIndexes()
+        selected_paths = []
+        for idx in selected_indexes:
+            item = idx.data(FileListModel.ITEM_ROLE)
+            if item:
+                selected_paths.append(item.path)
+
+        if index.isValid() and selected_paths:
+            # 选中了项目：显示剪切/复制/新建文件夹/重命名
+            if self.is_folder_panel:
+                act_new = menu.addAction("📁  新建文件夹")
+                act_new.triggered.connect(self.new_folder_requested.emit)
+                menu.addSeparator()
+            act_cut = menu.addAction("✂  剪切")
+            act_cut.triggered.connect(lambda: self.cut_requested.emit(selected_paths))
+            act_copy = menu.addAction("⎘  复制")
+            act_copy.triggered.connect(lambda: self.copy_requested.emit(selected_paths))
+            # 仅单选时允许重命名
+            if len(selected_paths) == 1:
+                menu.addSeparator()
+                act_rename = menu.addAction("✏  重命名\tF2")
+                act_rename.triggered.connect(lambda: self.rename_requested.emit(selected_paths[0]))
+        else:
+            # 空白处
+            act_new = menu.addAction("📁  新建文件夹")
+            act_new.triggered.connect(self.new_folder_requested.emit)
+            
+            # 修改：无论左侧还是右侧，空白处都显示粘贴选项
+            menu.addSeparator()
+            act_paste = menu.addAction("📋  粘贴")
+            act_paste.triggered.connect(self.paste_requested.emit)
+
+        menu.exec_(event.globalPos())
+
+    def _trigger_rename(self):
+        """F2 触发：重命名当前选中的第一个项目"""
+        indexes = self.selectedIndexes()
+        if len(indexes) == 1:
+            item = indexes[0].data(FileListModel.ITEM_ROLE)
+            if item:
+                self.rename_requested.emit(item.path)
 
     def leaveEvent(self, event):
         """鼠标离开视图时清除高亮"""
@@ -1113,12 +1713,8 @@ class MainWindow(QMainWindow):
         self.root_path: Optional[str] = None     # 根路径
         self.history: list[str] = []             # 浏览历史
         self.action_history = ActionHistory()    # 文件移动撤销/重做历史
-
-        # 滑块防抖定时器（300ms 后才真正更新缩略图大小）
-        self._thumb_size_timer = QTimer()
-        self._thumb_size_timer.setSingleShot(True)
-        self._thumb_size_timer.setInterval(300)
-        self._thumb_size_timer.timeout.connect(self._apply_thumb_size)
+        self._clipboard_paths: list[str] = []    # 剪贴板文件路径
+        self._clipboard_is_cut: bool = False     # True=剪切, False=复制
 
         self.setWindowTitle("PixClass")
         self.setMinimumSize(900, 620)
@@ -1127,8 +1723,23 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._apply_global_style()
 
+        # 安装事件过滤器来监听焦点变化
+        self.grid_view.installEventFilter(self)
+        self.folder_view.installEventFilter(self)
+
         QTimer.singleShot(100, self._load_last_session)
 
+    def eventFilter(self, obj, event):
+        """监听视图焦点变化，确保左右栏不同时选中"""
+        if event.type() == QEvent.FocusIn:
+            if obj == self.grid_view:
+                # 左侧获得焦点，清除右侧选中
+                self.folder_view.clearSelection()
+            elif obj == self.folder_view:
+                # 右侧获得焦点，清除左侧选中
+                self.grid_view.clearSelection()
+        return super().eventFilter(obj, event)
+    
     def _apply_global_style(self):
         # 全局样式
         self.setStyleSheet(f"""
@@ -1286,6 +1897,50 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self._redo_move)
         QShortcut(QKeySequence("Ctrl+Shift+Z"), self).activated.connect(self._redo_move)
 
+        toolbar.addSeparator()
+
+        # 剪切按钮（Ctrl+X）
+        self.btn_cut = QToolButton()
+        self.btn_cut.setText("✂  剪切")
+        self.btn_cut.setToolTip("剪切选中文件 (Ctrl+X)")
+        self.btn_cut.setCursor(Qt.PointingHandCursor)
+        self.btn_cut.setEnabled(False)
+        self.btn_cut.clicked.connect(self._toolbar_cut)
+        toolbar.addWidget(self.btn_cut)
+
+        # 复制按钮（Ctrl+C）
+        self.btn_copy = QToolButton()
+        self.btn_copy.setText("⎘  复制")
+        self.btn_copy.setToolTip("复制选中文件 (Ctrl+C)")
+        self.btn_copy.setCursor(Qt.PointingHandCursor)
+        self.btn_copy.setEnabled(False)
+        self.btn_copy.clicked.connect(self._toolbar_copy)
+        toolbar.addWidget(self.btn_copy)
+
+        # 粘贴按钮（Ctrl+V）
+        self.btn_paste = QToolButton()
+        self.btn_paste.setText("📋  粘贴")
+        self.btn_paste.setToolTip("粘贴到当前目录 (Ctrl+V)")
+        self.btn_paste.setCursor(Qt.PointingHandCursor)
+        self.btn_paste.setEnabled(False)
+        self.btn_paste.clicked.connect(self._paste_files)
+
+        toolbar.addWidget(self.btn_paste)
+
+        # 重命名按钮（F2）
+        self.btn_rename = QToolButton()
+        self.btn_rename.setText("✏  重命名")
+        self.btn_rename.setToolTip("重命名选中项目 (F2)")
+        self.btn_rename.setCursor(Qt.PointingHandCursor)
+        self.btn_rename.setEnabled(False)
+        self.btn_rename.clicked.connect(self._toolbar_rename)
+        toolbar.addWidget(self.btn_rename)
+
+        QShortcut(QKeySequence("Ctrl+X"), self).activated.connect(self._toolbar_cut)
+        QShortcut(QKeySequence("Ctrl+C"), self).activated.connect(self._toolbar_copy)
+        QShortcut(QKeySequence("Ctrl+V"), self).activated.connect(self._paste_files)
+        QShortcut(QKeySequence(Qt.Key_F2), self).activated.connect(self._toolbar_rename)
+
         # 伸缩占位
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -1302,8 +1957,8 @@ class MainWindow(QMainWindow):
         self.slider.setMaximum(MAX_THUMB_SIZE)
         self.slider.setValue(DEFAULT_THUMB_SIZE)
         self.slider.setFixedWidth(130)
-        self.slider.setToolTip("调整缩略图大小")
-        self.slider.valueChanged.connect(self._on_thumb_size_changed)
+        self.slider.setToolTip("调整缩略图大小 (Ctrl+滚轮)")
+        self.slider.valueChanged.connect(self._on_thumb_size_changed)  # 实时响应，不需要防抖
         toolbar.addWidget(self.slider)
 
         toolbar.addSeparator()
@@ -1320,14 +1975,15 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.breadcrumb)
 
         # ── 左右分栏容器 ──
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setStyleSheet(f"""
+        self.splitter = QSplitter(Qt.Horizontal)  
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
+        self.splitter.setStyleSheet(f"""
             QSplitter::handle {{
                 background: #2a2a36;
                 width: 2px;
             }}
         """)
-        main_layout.addWidget(splitter, 1)
+        main_layout.addWidget(self.splitter, 1)
 
         # ── 左侧：图片网格 ──
         left_widget = QWidget()
@@ -1339,20 +1995,29 @@ class MainWindow(QMainWindow):
         self.file_model = FileListModel()
         self.delegate = FileItemDelegate(self.file_model, DEFAULT_THUMB_SIZE)
         self.grid_view = ImageGridView(self.file_model, self.delegate)
+        self.grid_view.thumb_size_changed.connect(self._on_thumb_size_changed)
         cell = DEFAULT_THUMB_SIZE + 40
         self.grid_view.setGridSize(QSize(cell, cell))
         self.grid_view.folder_entered.connect(self._navigate_to)
         self.grid_view.image_opened.connect(self._open_image)
         self.grid_view.items_moved.connect(self._on_items_moved)
+        self.grid_view.cut_requested.connect(self._on_cut)
+        self.grid_view.copy_requested.connect(self._on_copy)
+        self.grid_view.paste_requested.connect(self._paste_files)
+        self.grid_view.new_folder_requested.connect(self._create_folder)
+        self.grid_view.rename_requested.connect(self._rename_item)
+        self.grid_view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.file_model.rowsInserted.connect(self._update_count)
         self.file_model.rowsRemoved.connect(self._update_count)
         self.file_model.modelReset.connect(self._update_count)
+        self.file_model.scan_finished.connect(self._on_file_scan_finished)
         left_layout.addWidget(self.grid_view, 1)
 
         # ── 空状态提示（放在左侧） ──
         self.empty_label = QLabel(
-            "📂\n\n点击「打开文件夹」选择图片目录\n\n"
-            "支持 JPG / PNG / GIF / BMP / WebP"
+            "点击「打开文件夹」选择图片目录\n\n"
+            "支持图片: JPG / PNG / GIF / BMP / WebP\n"
+            "支持视频: MP4 / AVI / MOV / MKV / WebM"
         )
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.empty_label.setStyleSheet(f"""
@@ -1364,7 +2029,23 @@ class MainWindow(QMainWindow):
         """)
         left_layout.addWidget(self.empty_label)
 
-        splitter.addWidget(left_widget)
+        self.no_media_label = QLabel(
+            "未发现图片或视频\n\n"
+            "支持的格式: JPG, PNG, GIF, BMP, WebP\n"
+            "MP4, AVI, MOV, MKV, WebM"
+        )
+        self.no_media_label.setAlignment(Qt.AlignCenter)
+        self.no_media_label.setStyleSheet(f"""
+            color: {TEXT_SECONDARY.name()};
+            font-size: 15px;
+            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            line-height: 2;
+            background: {BG_COLOR.name()};
+        """)
+        self.no_media_label.setVisible(False)
+        left_layout.addWidget(self.no_media_label)
+
+        self.splitter.addWidget(left_widget)
 
         # ── 右侧：子文件夹面板 ──
         right_widget = QWidget()
@@ -1424,12 +2105,22 @@ class MainWindow(QMainWindow):
         self.folder_model = FileListModel()
         self.folder_delegate = FileItemDelegate(self.folder_model, DEFAULT_THUMB_SIZE)
         self.folder_view = ImageGridView(self.folder_model, self.folder_delegate)
+        self.folder_view.thumb_size_changed.connect(self._on_thumb_size_changed)
+        self.folder_model.first_item_found.connect(self._on_folder_first_item)
+        self.folder_model.scan_finished.connect(self._on_folder_scan_finished)
         folder_cell = DEFAULT_THUMB_SIZE + 40
         self.folder_view.setGridSize(QSize(folder_cell, folder_cell))
         self.folder_view.folder_entered.connect(self._navigate_to)
         self.folder_view.image_opened.connect(self._open_image)
         # 拖拽图片到右侧文件夹时也触发 items_moved
         self.folder_view.items_moved.connect(self._on_items_moved)
+        self.folder_view.cut_requested.connect(self._on_cut)
+        self.folder_view.copy_requested.connect(self._on_copy)
+        self.folder_view.paste_requested.connect(self._paste_files)
+        self.folder_view.new_folder_requested.connect(self._create_folder)
+        self.folder_view.rename_requested.connect(self._rename_item)
+        self.folder_view.is_folder_panel = True
+        self.folder_view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.folder_view.setStyleSheet(f"""
             QListView {{
                 background-color: {PANEL_COLOR.name()};
@@ -1450,34 +2141,68 @@ class MainWindow(QMainWindow):
                 border-radius: 4px;
                 min-height: 30px;
             }}
+            QScrollBar::handle:vertical:hover {{
+                background: #777788;
+            }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                background: none;
                 height: 0px;
+                border: none;
+                subcontrol-origin: margin;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: none;
             }}
         """)
         right_layout.addWidget(self.folder_view, 1)
 
-        # 右侧空提示（无子文件夹时）
-        self.folder_empty_label = QLabel("暂无子文件夹\n\n点击 ＋ 新建文件夹")
-        self.folder_empty_label.setAlignment(Qt.AlignCenter)
-        self.folder_empty_label.setStyleSheet(f"""
-            color: {TEXT_SECONDARY.name()};
-            font-size: 13px;
-            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-            background: transparent;
-            line-height: 2;
+        # 右侧空提示（无子文件夹时：直接显示新建文件夹按钮）
+        self.folder_empty_widget = QWidget()
+        self.folder_empty_widget.setStyleSheet("background: transparent;")
+        empty_vbox = QVBoxLayout(self.folder_empty_widget)
+        empty_vbox.setAlignment(Qt.AlignCenter)
+        empty_vbox.setSpacing(0)
+
+        self.btn_create_folder_empty = QPushButton("＋  新建文件夹")
+        self.btn_create_folder_empty.setCursor(Qt.PointingHandCursor)
+        self.btn_create_folder_empty.setFixedSize(160, 40)
+        self.btn_create_folder_empty.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(99,179,237,18);
+                color: {ACCENT_COLOR.name()};
+                border: 1px solid rgba(99,179,237,50);
+                border-radius: 8px;
+                font-size: 14px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: rgba(99,179,237,35);
+                border: 1px solid {ACCENT_COLOR.name()};
+            }}
+            QPushButton:pressed {{
+                background: rgba(99,179,237,55);
+            }}
         """)
-        right_layout.addWidget(self.folder_empty_label)
+        self.btn_create_folder_empty.clicked.connect(self._create_folder)
+        empty_vbox.addWidget(self.btn_create_folder_empty, 0, Qt.AlignCenter)
 
-        splitter.addWidget(right_widget)
+        right_layout.addWidget(self.folder_empty_widget)
 
-        # 初始比例：
-        splitter.setSizes([700, 920])
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
+        self.splitter.addWidget(right_widget)
+
+        # 恢复保存的分栏位置
+        saved_sizes = load_global_setting(KEY_SPLITTER_SIZES)
+        if saved_sizes and isinstance(saved_sizes, list) and len(saved_sizes) == 2:
+            self.splitter.setSizes(saved_sizes)
+        else:
+            self.splitter.setSizes([700, 920])  # 默认值
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 0)
 
         # 初始状态隐藏右侧内容
         self.folder_view.setVisible(False)
-        self.folder_empty_label.setVisible(False)
+        self.folder_empty_widget.setVisible(False)
 
         # 状态栏
         self.status = QStatusBar()
@@ -1485,12 +2210,48 @@ class MainWindow(QMainWindow):
         self.status.showMessage("就绪 — 请打开一个文件夹以开始分类")
 
     def _load_last_session(self):
-            """启动时加载上次访问的目录"""
-            last_path = load_global_setting("last_root_path")
-            if last_path and os.path.exists(last_path):
-                self.root_path = last_path
-                self._navigate_to(last_path)
-                self.status.showMessage(f"已恢复上次会话: {last_path}")
+        """启动时加载上次访问的目录"""
+        # 恢复缩略图大小
+        saved_thumb_size = load_global_setting(KEY_THUMB_SIZE, DEFAULT_THUMB_SIZE)
+        if saved_thumb_size != self.slider.value():
+            self.slider.blockSignals(True)
+            self.slider.setValue(saved_thumb_size)
+            self.slider.blockSignals(False)
+            self.grid_view.update_thumb_size(saved_thumb_size)
+            self.folder_view.update_thumb_size(saved_thumb_size)
+        
+        # 恢复上次访问的目录
+        last = load_global_setting("last_root_path")
+        if last:
+            last = normalize_path(last)
+        if last and os.path.exists(last):
+            self.root_path = last
+            self._navigate_to(last, use_async=True)
+            self.status.showMessage(f"已恢复上次会话: {last}")
+
+    def _on_splitter_moved(self, pos, index):
+        """分栏位置变化时保存"""
+        if hasattr(self, 'splitter') and self.splitter:
+            sizes = self.splitter.sizes()
+            save_global_setting(KEY_SPLITTER_SIZES, sizes)
+
+    def _on_folder_first_item(self):
+        """发现第一个文件夹时立即显示面板"""
+        if self.current_path:
+            self.folder_view.setVisible(True)
+            self.folder_empty_widget.setVisible(False)
+
+    def _on_folder_scan_finished(self):
+        """文件夹扫描完成后，更新右侧面板的显示状态"""
+        if self.current_path:
+            has_folders = self.folder_model.rowCount() > 0
+            self.folder_view.setVisible(has_folders)
+            self.folder_empty_widget.setVisible(not has_folders)
+            self._update_count()
+
+    def _on_file_scan_finished(self):
+        """左侧图片扫描完成后更新显示"""
+        self._update_count()
 
     # ──────────────────────────────────────────
     #  槽函数：界面交互逻辑
@@ -1509,10 +2270,14 @@ class MainWindow(QMainWindow):
             self.history.clear()
             self.action_history.clear()
             self._update_undo_redo_buttons()
-            self._navigate_to(folder)
+            self._navigate_to(folder, use_async=True)  # 首次打开使用异步流式
 
-    def _navigate_to(self, path: str):
-        """导航到指定路径，左侧显示图片，右侧显示子文件夹"""
+    def _navigate_to(self, path: str, use_async: bool = False):
+        """
+        导航到指定路径
+        use_async: True 使用流式加载（首次打开），False 使用同步加载（导航刷新）
+        """
+        path = normalize_path(path)
         if not os.path.exists(path):
             return
 
@@ -1522,8 +2287,11 @@ class MainWindow(QMainWindow):
 
         self.current_path = path
 
-        # ── 左侧：加载图片（load_folder 内已含 beginResetModel/endResetModel）──
-        self.file_model.load_folder(path, dirs_only=False, files_only=True)
+        # ── 左侧：加载图片 ──
+        if use_async:
+            self.file_model.load_folder_async(path, dirs_only=False, files_only=True)
+        else:
+            self.file_model.load_folder_sync(path, dirs_only=False, files_only=True)
 
         self.breadcrumb.set_path(path, self.root_path or path)
 
@@ -1531,15 +2299,16 @@ class MainWindow(QMainWindow):
         self.btn_back.setEnabled(bool(can_go_up))
 
         # ── 右侧：加载子文件夹 ──
-        self.folder_model.load_folder(path, dirs_only=True, files_only=False)
+        if use_async:
+            self.folder_model.load_folder_async(path, dirs_only=True, files_only=False)
+        else:
+            self.folder_model.load_folder_sync(path, dirs_only=True, files_only=False)
 
-        has_folders = self.folder_model.rowCount() > 0
-        self.folder_view.setVisible(has_folders)
-        self.folder_empty_label.setVisible(not has_folders)
         self.btn_create_folder.setEnabled(True)
 
-        self.grid_view.setVisible(True)
+        # 初始隐藏，等 _update_count 根据实际情况显示
         self.empty_label.setVisible(False)
+        self.no_media_label.setVisible(False)
 
         self.status.showMessage(f"当前目录: {path}")
         self._update_count()
@@ -1552,55 +2321,162 @@ class MainWindow(QMainWindow):
         if self.current_path and self.root_path:
             parent = os.path.dirname(self.current_path)
             if parent != self.current_path:
-                self._navigate_to(parent)
+                self._navigate_to(parent, use_async=False)  # 返回上级使用同步
 
     def _go_history_back(self):
         if self.history:
             prev = self.history.pop()
             self.current_path = None
-            self._navigate_to(prev)
+            self._navigate_to(prev, use_async=False)  # 历史导航使用同步
             if not self.history:
                 self.btn_hist_back.setEnabled(False)
 
     def _refresh(self):
-        """刷新当前目录（同时更新左侧图片和右侧文件夹缩略图）"""
+        """刷新当前目录（同时更新 OrderManager 记录）"""
         if self.current_path:
+            # 同步当前目录的 OrderManager 记录
+            om = OrderManager(self.current_path)
+            om.sync_with_filesystem()
+            
             # 清除当前目录缓存
             self.delegate.invalidate_cache(self.current_path)
             self.folder_delegate.invalidate_cache(self.current_path)
-            # 清除所有子文件夹的封面缓存
+            
+            # 清除所有子文件夹的缓存并同步记录
             try:
                 with os.scandir(self.current_path) as it:
                     for entry in it:
                         if entry.is_dir():
+                            sub_om = OrderManager(entry.path)
+                            sub_om.sync_with_filesystem()
                             self.delegate.invalidate_cache(entry.path)
                             self.folder_delegate.invalidate_cache(entry.path)
             except Exception:
                 pass
+            
             cur = self.current_path
             self.current_path = None
-            self._navigate_to(cur)
+            self._navigate_to(cur, use_async=False)
             self.status.showMessage("已刷新")
 
     def _create_folder(self):
         if not self.current_path:
             return
-        name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称:")
-        if ok and name.strip():
-            new_path = os.path.join(self.current_path, name.strip())
-            try:
-                os.makedirs(new_path, exist_ok=True)
-                cur = self.current_path
-                self.current_path = None
-                self._navigate_to(cur)
-                self.status.showMessage(f"已创建文件夹: {name.strip()}")
-            except Exception as e:
-                QMessageBox.warning(self, "创建失败", str(e))
+
+        # ── 自定义深色风格对话框 ──
+        dlg = QDialog(self)
+        dlg.setWindowTitle("新建文件夹")
+        dlg.setModal(True)
+        dlg.setFixedWidth(340)
+        dlg.setStyleSheet(f"""
+            QDialog {{
+                background: {PANEL_COLOR.name()};
+                color: {TEXT_PRIMARY.name()};
+            }}
+            QLabel {{
+                color: {TEXT_PRIMARY.name()};
+                font-size: 13px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                background: transparent;
+            }}
+            QLineEdit {{
+                background: {BG_COLOR.name()};
+                color: {TEXT_PRIMARY.name()};
+                border: 1px solid #3a3a50;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 13px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                selection-background-color: {ACCENT_COLOR.name()};
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {ACCENT_COLOR.name()};
+            }}
+            QPushButton {{
+                font-size: 13px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                border-radius: 6px;
+                padding: 6px 20px;
+                min-width: 72px;
+            }}
+            QPushButton#btn_ok {{
+                background: {ACCENT_COLOR.name()};
+                color: white;
+                border: none;
+                font-weight: bold;
+            }}
+            QPushButton#btn_ok:hover {{
+                background: {ACCENT2_COLOR.name()};
+            }}
+            QPushButton#btn_cancel {{
+                background: #2a2a36;
+                color: {TEXT_PRIMARY.name()};
+                border: 1px solid #3a3a50;
+            }}
+            QPushButton#btn_cancel:hover {{
+                background: #3a3a4a;
+            }}
+        """)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(12)
+
+        lbl = QLabel("文件夹名称：")
+        layout.addWidget(lbl)
+
+        edit = QLineEdit()
+        edit.setPlaceholderText("请输入文件夹名称")
+        layout.addWidget(edit)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch()
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("btn_cancel")
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_ok = QPushButton("确定")
+        btn_ok.setObjectName("btn_ok")
+        btn_ok.setCursor(Qt.PointingHandCursor)
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_ok)
+
+        layout.addLayout(btn_row)
+
+        edit.setFocus()
+        edit.returnPressed.connect(dlg.accept)
+
+        if dlg.exec_() == QDialog.Accepted:
+            name = edit.text().strip()
+            if name:
+                new_path = os.path.join(self.current_path, name)
+                try:
+                    os.makedirs(new_path, exist_ok=True)
+                    cur = self.current_path
+                    self.current_path = None
+                    self._navigate_to(cur)
+                    self.status.showMessage(f"已创建文件夹: {name}")
+                except Exception as e:
+                    QMessageBox.warning(self, "创建失败", str(e))
 
     def _on_thumb_size_changed(self, value: int):
-        # 仅重启防抖定时器，不立即更新（避免拖动时每帧都重建缓存）
-        self._pending_thumb_size = value
-        self._thumb_size_timer.start()
+        """实时更新缩略图大小"""
+        if self.slider.value() != value:
+            self.slider.blockSignals(True)
+            self.slider.setValue(value)
+            self.slider.blockSignals(False)
+        
+        # 实时更新两个视图
+        self.grid_view.update_thumb_size(value)
+        self.folder_view.update_thumb_size(value)
+        
+        # 持久化保存缩略图大小
+        save_global_setting(KEY_THUMB_SIZE, value)
 
     def _apply_thumb_size(self):
         value = getattr(self, '_pending_thumb_size', self.slider.value())
@@ -1619,11 +2495,13 @@ class MainWindow(QMainWindow):
             subprocess.call(['xdg-open', path])
 
     def _on_items_moved(self, source_paths: list, dest_folder: str):
-        """处理图片拖拽移动，移动后立即刷新目标文件夹缩略图"""
+        """处理图片拖拽移动"""
         order_mgr = OrderManager(dest_folder)
         moved_count = 0
         errors = []
-        move_records: list[tuple[str, str]] = []  # (src, dst) 成功移动的记录
+        move_records: list[tuple[str, str]] = []
+
+        dest_was_empty = self._is_folder_empty_of_media(dest_folder)
 
         for src_path in source_paths:
             filename = os.path.basename(src_path)
@@ -1640,23 +2518,49 @@ class MainWindow(QMainWindow):
                 shutil.move(src_path, dest_path)
                 new_filename = os.path.basename(dest_path)
                 order_mgr.add_image(new_filename)
+                
+                # 从源文件夹的 OrderManager 中移除记录
+                src_dir = os.path.dirname(src_path)
+                src_om = OrderManager(src_dir)
+                src_om.remove_image(filename)
+                
+                # 增量更新：直接从模型中移除
                 self.file_model.remove_item(src_path)
+                
                 move_records.append((src_path, dest_path))
                 moved_count += 1
             except Exception as e:
                 errors.append(f"{filename}: {e}")
 
-        # 记录历史（只记录成功的）
         if move_records:
             self.action_history.push(MoveRecord(move_records))
             self._update_undo_redo_buttons()
 
-        # 彻底清除目标文件夹的缩略图缓存
-        self.delegate.invalidate_cache(dest_folder)
-        self.folder_delegate.invalidate_cache(dest_folder)
+        # 智能刷新目标文件夹
+        if dest_was_empty and moved_count > 0:
+            self.delegate.invalidate_cache(dest_folder)
+            self.folder_delegate.invalidate_cache(dest_folder)
+            self.folder_model.refresh_item(dest_folder)
+        
+        # 如果目标文件夹就是当前目录，添加移入的文件到模型
+        if dest_folder == self.current_path:
+            for src_path, dest_path in [(src, dst) for src, dst in zip(source_paths, 
+                                             [os.path.join(dest_folder, os.path.basename(src)) for src in source_paths])]:
+                if os.path.exists(dest_path):
+                    item = FileItem(dest_path, False)
+                    self._add_item_to_model(item)
 
-        # 刷新右侧对应文件夹项的缩略图
-        self.folder_model.refresh_item(dest_folder)
+        # 检查源文件夹是否变空
+        source_dirs = set(os.path.dirname(src) for src in source_paths)
+        for src_dir in source_dirs:
+            if self._is_folder_empty_of_media(src_dir):
+                src_om = OrderManager(src_dir)
+                src_om.clear_records()
+                self.delegate.invalidate_cache(src_dir)
+                self.folder_delegate.invalidate_cache(src_dir)
+                self.folder_model.refresh_item(src_dir)
+
+        self._update_count()
         self.folder_view.viewport().update()
         self.grid_view.viewport().update()
 
@@ -1664,31 +2568,78 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "移动出错",
                                 "以下文件移动失败:\n" + "\n".join(errors))
 
-        self.status.showMessage(f"已将 {moved_count} 张图片移入 「{os.path.basename(dest_folder)}」")
+        self.status.showMessage(f"已将 {moved_count} 个文件移入 「{os.path.basename(dest_folder)}」")
+
+    def _is_folder_empty_of_media(self, folder_path: str) -> bool:
+        """检查文件夹是否不包含任何媒体文件（图片或视频）"""
+        if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
+            return True
+        
+        try:
+            with os.scandir(folder_path) as it:
+                for entry in it:
+                    if entry.is_file() and not entry.name.startswith('.'):
+                        ext = Path(entry.name).suffix.lower()
+                        if ext in ALL_MEDIA_EXTENSIONS:
+                            return False
+        except (PermissionError, OSError):
+            pass
+        
+        return True
+
+    def _clear_folder_order_records(self, folder_path: str):
+        """清除指定文件夹在 OrderManager 中的记录"""
+        try:
+            om = OrderManager(folder_path)
+            # 获取当前记录
+            folder_data = OrderManager._cached_data.get(folder_path, [])
+            if folder_data:
+                # 清空记录
+                OrderManager._cached_data[folder_path] = []
+                om._save_all()
+        except Exception:
+            pass
 
     def _undo_move(self):
-        """撤销上一步文件移动"""
+        """撤销上一步操作（支持移动和粘贴）"""
         if not self.action_history.can_undo():
             return
+        
         rec = self.action_history.pop_undo()
         if not rec:
             return
 
-        errors = []
-        affected_src_dirs: set[str] = set()
-        affected_dst_dirs: set[str] = set()
+        # 根据记录类型处理
+        if isinstance(rec, MoveRecord):
+            self._undo_move_record(rec)
+        elif isinstance(rec, PasteRecord):
+            self._undo_paste_record(rec)
+        
+        self._update_undo_redo_buttons()
 
-        # 逆序还原：把 dst 移回 src
+    def _undo_move_record(self, rec: MoveRecord):
+        """撤销移动操作"""
+        errors = []
+        affected_dst_dirs: set[str] = set()
+        affected_src_dirs: set[str] = set()
+        was_empty: dict[str, bool] = {}
+
         for src_path, dst_path in reversed(rec.moves):
             if not os.path.exists(dst_path):
                 errors.append(f"{os.path.basename(dst_path)}: 文件不存在")
                 continue
-            # 确保原目录仍然存在
+
             src_dir = os.path.dirname(src_path)
+            dst_dir = os.path.dirname(dst_path)
+
             if not os.path.exists(src_dir):
                 errors.append(f"{os.path.basename(src_path)}: 原文件夹不存在")
                 continue
-            # 处理回移冲突
+
+            for d in (src_dir, dst_dir):
+                if d not in was_empty:
+                    was_empty[d] = self._is_folder_empty_of_media(d)
+
             restore_path = src_path
             if os.path.exists(restore_path) and restore_path != dst_path:
                 base, ext = os.path.splitext(os.path.basename(src_path))
@@ -1696,43 +2647,133 @@ class MainWindow(QMainWindow):
                 while os.path.exists(restore_path):
                     restore_path = os.path.join(src_dir, f"{base}_{counter}{ext}")
                     counter += 1
+
             try:
                 shutil.move(dst_path, restore_path)
-                affected_dst_dirs.add(os.path.dirname(dst_path))
+
+                src_om = OrderManager(src_dir)
+                dst_om = OrderManager(dst_dir)
+                dst_om.remove_image(os.path.basename(dst_path))
+                src_om.add_image(os.path.basename(restore_path))
+
+                affected_dst_dirs.add(dst_dir)
                 affected_src_dirs.add(src_dir)
+
+                if dst_dir == self.current_path:
+                    self.file_model.remove_item(dst_path)
+
+                if src_dir == self.current_path:
+                    if os.path.exists(restore_path):
+                        item = FileItem(restore_path, False)
+                        self._add_item_to_model(item)
+
             except Exception as e:
                 errors.append(f"{os.path.basename(dst_path)}: {e}")
 
-        self._refresh_after_undo_redo(affected_src_dirs | affected_dst_dirs)
-        self._update_undo_redo_buttons()
+        for d in affected_src_dirs | affected_dst_dirs:
+            self._refresh_directory_cache(d, was_empty=was_empty.get(d, False))
+
+        self._update_count()
+        self.folder_view.viewport().update()
+        self.grid_view.viewport().update()
 
         if errors:
             QMessageBox.warning(self, "撤销出错", "\n".join(errors))
         else:
-            n = len(rec.moves)
-            self.status.showMessage(f"已撤销：还原了 {n} 张图片")
+            self.status.showMessage(f"已撤销：还原了 {len(rec.moves)} 个文件")
+
+    def _undo_paste_record(self, rec: PasteRecord):
+        """撤销粘贴操作（删除粘贴的文件）"""
+        errors = []
+        affected_dirs: set[str] = set()
+        deleted_count = 0
+
+        for src_path, dst_path in rec.copies:
+            if not os.path.exists(dst_path):
+                continue
+
+            dst_dir = os.path.dirname(dst_path)
+            affected_dirs.add(dst_dir)
+            
+            is_dir = os.path.isdir(dst_path)
+
+            try:
+                # 删除粘贴的文件/文件夹
+                if is_dir:
+                    shutil.rmtree(dst_path)
+                else:
+                    os.remove(dst_path)
+                
+                # 从 OrderManager 中移除
+                om = OrderManager(dst_dir)
+                om.remove_image(os.path.basename(dst_path))
+                
+                # 从对应的模型中移除
+                if dst_dir == self.current_path:
+                    if is_dir:
+                        # 从右侧文件夹模型中移除
+                        self.folder_model.remove_item(dst_path)
+                    else:
+                        # 从左侧文件模型中移除
+                        self.file_model.remove_item(dst_path)
+                
+                deleted_count += 1
+            except Exception as e:
+                errors.append(f"{os.path.basename(dst_path)}: {e}")
+
+        # 刷新受影响的目录缓存
+        for d in affected_dirs:
+            self._refresh_directory_cache(d, was_empty=False)
+
+        self._update_count()
+        self.folder_view.viewport().update()
+        self.grid_view.viewport().update()
+
+        if errors:
+            QMessageBox.warning(self, "撤销出错", "\n".join(errors))
+        else:
+            self.status.showMessage(f"已撤销：删除了 {deleted_count} 个粘贴的项目")
 
     def _redo_move(self):
-        """重做下一步文件移动"""
+        """重做下一步操作（支持移动和粘贴）"""
         if not self.action_history.can_redo():
             return
+        
         rec = self.action_history.pop_redo()
         if not rec:
             return
 
+        # 根据记录类型处理
+        if isinstance(rec, MoveRecord):
+            self._redo_move_record(rec)
+        elif isinstance(rec, PasteRecord):
+            self._redo_paste_record(rec)
+        
+        self._update_undo_redo_buttons()
+
+    def _redo_move_record(self, rec: MoveRecord):
+        """重做移动操作"""
         errors = []
         affected_dirs: set[str] = set()
+        was_empty: dict[str, bool] = {}
 
         for src_path, dst_path in rec.moves:
-            # redo 时 src 已经在还原位置
-            restore_path = src_path  # 撤销后文件在原位，可能有重命名，此处尝试原路径
+            restore_path = src_path
             if not os.path.exists(restore_path):
                 errors.append(f"{os.path.basename(src_path)}: 文件不存在，无法重做")
                 continue
+
             dest_folder = os.path.dirname(dst_path)
+            src_dir = os.path.dirname(restore_path)
+
             if not os.path.exists(dest_folder):
                 errors.append(f"目标文件夹不存在: {dest_folder}")
                 continue
+
+            for d in (src_dir, dest_folder):
+                if d not in was_empty:
+                    was_empty[d] = self._is_folder_empty_of_media(d)
+
             redo_dst = dst_path
             if os.path.exists(redo_dst) and redo_dst != restore_path:
                 base, ext = os.path.splitext(os.path.basename(dst_path))
@@ -1740,42 +2781,622 @@ class MainWindow(QMainWindow):
                 while os.path.exists(redo_dst):
                     redo_dst = os.path.join(dest_folder, f"{base}_{counter}{ext}")
                     counter += 1
+
             try:
                 shutil.move(restore_path, redo_dst)
-                affected_dirs.add(os.path.dirname(restore_path))
+
+                src_om = OrderManager(src_dir)
+                dst_om = OrderManager(dest_folder)
+                src_om.remove_image(os.path.basename(restore_path))
+                dst_om.add_image(os.path.basename(redo_dst))
+
+                affected_dirs.add(src_dir)
                 affected_dirs.add(dest_folder)
+
+                if src_dir == self.current_path:
+                    self.file_model.remove_item(restore_path)
+
+                if dest_folder == self.current_path:
+                    if os.path.exists(redo_dst):
+                        item = FileItem(redo_dst, False)
+                        self._add_item_to_model(item)
+
             except Exception as e:
                 errors.append(f"{os.path.basename(restore_path)}: {e}")
 
-        self._refresh_after_undo_redo(affected_dirs)
-        self._update_undo_redo_buttons()
+        for d in affected_dirs:
+            self._refresh_directory_cache(d, was_empty=was_empty.get(d, False))
+
+        self._update_count()
+        self.folder_view.viewport().update()
+        self.grid_view.viewport().update()
 
         if errors:
             QMessageBox.warning(self, "重做出错", "\n".join(errors))
         else:
-            n = len(rec.moves)
-            self.status.showMessage(f"已重做：移动了 {n} 张图片")
+            self.status.showMessage(f"已重做：移动了 {len(rec.moves)} 个文件")
 
-    def _refresh_after_undo_redo(self, affected_dirs: set[str]):
-        """撤销/重做后刷新受影响的目录缓存，并重新加载当前视图"""
+    def _redo_paste_record(self, rec: PasteRecord):
+        """重做粘贴操作"""
+        errors = []
+        affected_dirs: set[str] = set()
+        pasted_count = 0
+
+        for src_path, dst_path in rec.copies:
+            if not os.path.exists(src_path):
+                errors.append(f"{os.path.basename(src_path)}: 源文件不存在")
+                continue
+
+            dst_dir = os.path.dirname(dst_path)
+            affected_dirs.add(dst_dir)
+
+            # 如果目标已存在，生成新名称
+            final_dst = dst_path
+            if os.path.exists(final_dst):
+                base, ext = os.path.splitext(os.path.basename(dst_path))
+                counter = 1
+                while os.path.exists(final_dst):
+                    final_dst = os.path.join(dst_dir, f"{base} ({counter}){ext}")
+                    counter += 1
+
+            try:
+                if os.path.isdir(src_path):
+                    shutil.copytree(src_path, final_dst)
+                    is_dir = True
+                else:
+                    shutil.copy2(src_path, final_dst)
+                    is_dir = False
+                
+                # 添加到 OrderManager
+                om = OrderManager(dst_dir)
+                om.add_image(os.path.basename(final_dst))
+                
+                # 添加到对应的模型
+                if dst_dir == self.current_path:
+                    if os.path.exists(final_dst):
+                        item = FileItem(final_dst, is_dir)
+                        if is_dir:
+                            # 添加到右侧文件夹模型
+                            self._add_item_to_folder_model(item)
+                        else:
+                            # 添加到左侧文件模型
+                            self._add_item_to_model(item)
+                
+                pasted_count += 1
+            except Exception as e:
+                errors.append(f"{os.path.basename(src_path)}: {e}")
+
+        # 刷新受影响的目录缓存
         for d in affected_dirs:
-            self.delegate.invalidate_cache(d)
-            self.folder_delegate.invalidate_cache(d)
-            self.folder_model.refresh_item(d)
-        # 重新加载当前目录
-        if self.current_path:
-            cur = self.current_path
-            self.current_path = None
-            self._navigate_to(cur)
+            self._refresh_directory_cache(d, was_empty=False)
+
+        self._update_count()
+        self.folder_view.viewport().update()
+        self.grid_view.viewport().update()
+
+        if errors:
+            QMessageBox.warning(self, "重做出错", "\n".join(errors))
+        else:
+            self.status.showMessage(f"已重做：粘贴了 {pasted_count} 个项目")
+
+    def _add_item_to_folder_model(self, item: FileItem):
+        """将单个文件夹项目按排序规则添加到右侧文件夹模型中"""
+        items = self.folder_model.items
+        
+        # 找到正确的插入位置（只处理文件夹）
+        insert_idx = len(items)
+        if item.is_dir:
+            for i, existing in enumerate(items):
+                if not existing.is_dir or existing.name.lower() > item.name.lower():
+                    insert_idx = i
+                    break
+        
+        self.folder_model.beginInsertRows(QModelIndex(), insert_idx, insert_idx)
+        items.insert(insert_idx, item)
+        self.folder_model.endInsertRows()
+
+    def _refresh_directory_cache(self, dir_path: str, was_empty: bool):
+        """刷新单个目录的缓存：只在空/非空状态发生变化时才 invalidate"""
+        if not os.path.exists(dir_path):
+            return
+
+        om = OrderManager(dir_path)
+        is_empty_now = self._is_folder_empty_of_media(dir_path)
+
+        if is_empty_now:
+            # 现在为空 → 清除记录和缓存
+            om.clear_records()
+            self.delegate.invalidate_cache(dir_path)
+            self.folder_delegate.invalidate_cache(dir_path)
+        elif was_empty and not is_empty_now:
+            # 从空变非空 → 缓存失效，重新加载封面
+            self.delegate.invalidate_cache(dir_path)
+            self.folder_delegate.invalidate_cache(dir_path)
+        # 否则（一直非空）→ 不动缓存，只触发重绘
+
+        self.folder_model.refresh_item(dir_path)
+
+    def _add_item_to_model(self, item: FileItem):
+        """将单个项目按排序规则添加到模型中"""
+        items = self.file_model.items
+        
+        # 找到正确的插入位置
+        insert_idx = len(items)
+        if item.is_dir:
+            for i, existing in enumerate(items):
+                if not existing.is_dir or existing.name.lower() > item.name.lower():
+                    insert_idx = i
+                    break
+        else:
+            for i, existing in enumerate(items):
+                if not existing.is_dir and existing.name.lower() > item.name.lower():
+                    insert_idx = i
+                    break
+        
+        self.file_model.beginInsertRows(QModelIndex(), insert_idx, insert_idx)
+        items.insert(insert_idx, item)
+        self.file_model.endInsertRows()
 
     def _update_undo_redo_buttons(self):
         self.btn_undo.setEnabled(self.action_history.can_undo())
         self.btn_redo.setEnabled(self.action_history.can_redo())
 
+    def _on_selection_changed(self, selected, deselected):
+        """选中项变化时更新剪切/复制/重命名按钮状态"""
+        # 获取发送信号的视图
+        sender = self.sender()
+        
+        # 检查左侧选中项
+        left_indexes = self.grid_view.selectedIndexes()
+        # 检查右侧选中项
+        right_indexes = self.folder_view.selectedIndexes()
+        
+        # 确定当前激活的视图（有焦点的）
+        focused = QApplication.focusWidget()
+        if focused == self.grid_view or focused == self.grid_view.viewport():
+            has_sel = bool(left_indexes)
+            single_sel = len(left_indexes) == 1
+        elif focused == self.folder_view or focused == self.folder_view.viewport():
+            has_sel = bool(right_indexes)
+            single_sel = len(right_indexes) == 1
+        else:
+            # 没有焦点时，根据发送者判断
+            if sender == self.grid_view.selectionModel():
+                has_sel = bool(left_indexes)
+                single_sel = len(left_indexes) == 1
+            elif sender == self.folder_view.selectionModel():
+                has_sel = bool(right_indexes)
+                single_sel = len(right_indexes) == 1
+            else:
+                # 默认检查两个视图
+                has_sel = bool(left_indexes) or bool(right_indexes)
+                single_sel = (len(left_indexes) + len(right_indexes)) == 1
+        
+        self.btn_cut.setEnabled(has_sel)
+        self.btn_copy.setEnabled(has_sel)
+        self.btn_rename.setEnabled(single_sel)
+
+    def _get_focused_view(self):
+        """获取当前焦点的视图"""
+        focused = QApplication.focusWidget()
+        if focused == self.grid_view or focused == self.grid_view.viewport():
+            return self.grid_view
+        elif focused == self.folder_view or focused == self.folder_view.viewport():
+            return self.folder_view
+        return None
+
+    def _get_selected_paths(self) -> list:
+        paths = []
+        for idx in self.grid_view.selectedIndexes():
+            item = idx.data(FileListModel.ITEM_ROLE)
+            if item:
+                paths.append(item.path)
+        return paths
+
+    def _toolbar_cut(self):
+        """剪切：根据焦点视图获取选中项"""
+        focused = QApplication.focusWidget()
+        
+        if focused == self.folder_view or focused == self.folder_view.viewport():
+            paths = []
+            for idx in self.folder_view.selectedIndexes():
+                item = idx.data(FileListModel.ITEM_ROLE)
+                if item:
+                    paths.append(item.path)
+        else:
+            paths = []
+            for idx in self.grid_view.selectedIndexes():
+                item = idx.data(FileListModel.ITEM_ROLE)
+                if item:
+                    paths.append(item.path)
+        
+        if paths:
+            self._on_cut(paths)
+
+    def _toolbar_copy(self):
+        """复制：根据焦点视图获取选中项"""
+        focused = QApplication.focusWidget()
+        
+        if focused == self.folder_view or focused == self.folder_view.viewport():
+            paths = []
+            for idx in self.folder_view.selectedIndexes():
+                item = idx.data(FileListModel.ITEM_ROLE)
+                if item:
+                    paths.append(item.path)
+        else:
+            paths = []
+            for idx in self.grid_view.selectedIndexes():
+                item = idx.data(FileListModel.ITEM_ROLE)
+                if item:
+                    paths.append(item.path)
+        
+        if paths:
+            self._on_copy(paths)
+
+    def _toolbar_rename(self):
+        """工具栏/F2 触发重命名：取当前焦点视图的单选项"""
+        # 确定当前焦点在哪个视图
+        focused = QApplication.focusWidget()
+        
+        if focused == self.grid_view or focused == self.grid_view.viewport():
+            indexes = self.grid_view.selectedIndexes()
+        elif focused == self.folder_view or focused == self.folder_view.viewport():
+            indexes = self.folder_view.selectedIndexes()
+        else:
+            # 默认：检查两个视图，优先非空的那个
+            indexes = self.grid_view.selectedIndexes()
+            if not indexes:
+                indexes = self.folder_view.selectedIndexes()
+        
+        if len(indexes) == 1:
+            item = indexes[0].data(FileListModel.ITEM_ROLE)
+            if item:
+                self._rename_item(item.path)
+        elif len(indexes) == 0:
+            self.status.showMessage("请先选中要重命名的项目", 2000)
+        else:
+            self.status.showMessage("一次只能重命名一个项目", 2000)
+
+    def _rename_item(self, path: str):
+        """重命名对话框，支持文件和文件夹"""
+        if not os.path.exists(path):
+            return
+
+        old_name = os.path.basename(path)
+        is_dir = os.path.isdir(path)
+        parent_dir = os.path.dirname(path)
+
+        # ── 深色风格对话框 ──
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"重命名{'文件夹' if is_dir else '文件'}")
+        dlg.setModal(True)
+        dlg.setFixedWidth(360)
+        dlg.setStyleSheet(f"""
+            QDialog {{
+                background: {PANEL_COLOR.name()};
+                color: {TEXT_PRIMARY.name()};
+            }}
+            QLabel {{
+                color: {TEXT_PRIMARY.name()};
+                font-size: 13px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                background: transparent;
+            }}
+            QLineEdit {{
+                background: {BG_COLOR.name()};
+                color: {TEXT_PRIMARY.name()};
+                border: 1px solid #3a3a50;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 13px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                selection-background-color: {ACCENT_COLOR.name()};
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {ACCENT_COLOR.name()};
+            }}
+            QPushButton {{
+                font-size: 13px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                border-radius: 6px;
+                padding: 6px 20px;
+                min-width: 72px;
+            }}
+            QPushButton#btn_ok {{
+                background: {ACCENT_COLOR.name()};
+                color: white;
+                border: none;
+                font-weight: bold;
+            }}
+            QPushButton#btn_ok:hover {{ background: {ACCENT2_COLOR.name()}; }}
+            QPushButton#btn_cancel {{
+                background: #2a2a36;
+                color: {TEXT_PRIMARY.name()};
+                border: 1px solid #3a3a50;
+            }}
+            QPushButton#btn_cancel:hover {{ background: #3a3a4a; }}
+        """)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(12)
+
+        lbl = QLabel(f"{'文件夹' if is_dir else '文件'}名称：")
+        layout.addWidget(lbl)
+
+        edit = QLineEdit(old_name)
+        layout.addWidget(edit)
+
+        # Windows 风格预选：文件夹全选，文件只选主体（不含扩展名）
+        if is_dir:
+            edit.selectAll()
+        else:
+            stem_len = len(Path(old_name).stem)
+            edit.setSelection(0, stem_len)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch()
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("btn_cancel")
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_ok = QPushButton("确定")
+        btn_ok.setObjectName("btn_ok")
+        btn_ok.setCursor(Qt.PointingHandCursor)
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_ok)
+
+        layout.addLayout(btn_row)
+
+        edit.setFocus()
+        edit.returnPressed.connect(dlg.accept)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        new_name = edit.text().strip()
+
+        # 未改名或为空则跳过
+        if not new_name or new_name == old_name:
+            return
+
+        # 非法字符检查（Windows 规则，跨平台通用）
+        illegal_chars = r'\/:*?"<>|'
+        if any(c in new_name for c in illegal_chars):
+            QMessageBox.warning(self, "重命名失败",
+                f"文件名不能包含以下字符：\n{illegal_chars}")
+            return
+
+        new_path = os.path.join(parent_dir, new_name)
+
+        # 目标已存在：询问是否覆盖
+        if os.path.exists(new_path):
+            reply = QMessageBox.question(
+                self, "确认覆盖",
+                f"目标位置已存在「{new_name}」，是否替换？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        try:
+            os.rename(path, new_path)
+            self.status.showMessage(f"已重命名：{old_name}  →  {new_name}")
+        except Exception as e:
+            QMessageBox.warning(self, "重命名失败", str(e))
+            return
+
+        # ── 更新缓存与模型 ──
+        if is_dir:
+            # 文件夹：迁移缓存和 OrderManager 记录
+            self.delegate.invalidate_cache(path)
+            self.folder_delegate.invalidate_cache(path)
+            # 迁移 OrderManager 记录
+            old_norm = normalize_path(os.path.abspath(path))
+            new_norm = normalize_path(os.path.abspath(new_path))
+            if old_norm in OrderManager._cached_data:
+                OrderManager._cached_data[new_norm] = OrderManager._cached_data.pop(old_norm)
+                # 保存到配置文件
+                save_global_setting("folder_metadata", OrderManager._cached_data)
+        else:
+            # 媒体文件：删除旧路径缓存
+            old_cache_key = f"media:{normalize_path(path)}"
+            self.delegate._thumb_cache.pop(old_cache_key, None)
+            self.folder_delegate._thumb_cache.pop(old_cache_key, None)
+            # 更新父文件夹 OrderManager 中的文件名记录
+            om = OrderManager(parent_dir)
+            om.remove_image(old_name)
+            om.add_image(new_name)
+
+        # 刷新视图
+        cur = self.current_path
+        self.current_path = None
+        self._navigate_to(cur, use_async=False)
+
+    def _on_cut(self, paths: list):
+        if not paths:
+            return
+        self._clipboard_paths = paths
+        self._clipboard_is_cut = True
+        self.btn_paste.setEnabled(True)
+        self.status.showMessage(f"已剪切 {len(paths)} 个文件")
+
+    def _on_copy(self, paths: list):
+        if not paths:
+            return
+        self._clipboard_paths = paths
+        self._clipboard_is_cut = False
+        self.btn_paste.setEnabled(True)
+        self.status.showMessage(f"已复制 {len(paths)} 个文件")
+
+    def _paste_files(self):
+        """粘贴剪贴板文件到当前目录"""
+        if not self._clipboard_paths:
+            self.status.showMessage("剪贴板为空", 2000)
+            return
+        
+        # 目标目录始终是当前路径（无需判断焦点）
+        target_dir = self.current_path
+        
+        if not target_dir:
+            self.status.showMessage("请先打开一个文件夹", 2000)
+            return
+        
+        errors = []
+        moved_count = 0
+        copied_count = 0
+        paste_records = []  # 记录所有粘贴操作
+        
+        # 记录受影响的源文件夹
+        affected_source_dirs = set()
+        
+        # 粘贴前：检查目标文件夹是否为空
+        dest_was_empty = self._is_folder_empty_of_media(target_dir)
+
+        for src_path in self._clipboard_paths:
+            if not os.path.exists(src_path):
+                errors.append(f"{os.path.basename(src_path)}: 源文件不存在")
+                continue
+            
+            filename = os.path.basename(src_path)
+            
+            # 获取源文件所在目录
+            src_dir = os.path.dirname(src_path)
+            
+            # 判断是否在原地粘贴（复制模式且源目录就是目标目录）
+            is_same_dir_copy = (not self._clipboard_is_cut and 
+                            os.path.abspath(src_dir) == os.path.abspath(target_dir))
+            
+            if is_same_dir_copy:
+                # 原地复制：自动生成带"copy"后缀的文件名
+                base, ext = os.path.splitext(filename)
+                counter = 1
+                
+                # 尝试不同的文件名模式
+                # 先尝试 "文件名 - copy.ext"
+                dest_path = os.path.join(target_dir, f"{base} - copy{ext}")
+                
+                # 如果已存在，尝试 "文件名 - copy (2).ext", "文件名 - copy (3).ext" ...
+                while os.path.exists(dest_path):
+                    counter += 1
+                    dest_path = os.path.join(target_dir, f"{base} - copy ({counter}){ext}")
+            else:
+                # 非原地复制：正常处理
+                dest_path = os.path.join(target_dir, filename)
+                
+                # 避免自己粘贴到自己（剪切模式）
+                if self._clipboard_is_cut and os.path.abspath(src_path) == os.path.abspath(dest_path):
+                    continue
+                
+                # 避免覆盖
+                if os.path.exists(dest_path):
+                    base, ext = os.path.splitext(filename)
+                    counter = 1
+                    while os.path.exists(dest_path):
+                        counter += 1
+                        dest_path = os.path.join(target_dir, f"{base} ({counter}){ext}")
+            
+            try:
+                if self._clipboard_is_cut:
+                    # 记录源文件夹路径
+                    source_dir = os.path.dirname(src_path)
+                    affected_source_dirs.add(source_dir)
+                    
+                    shutil.move(src_path, dest_path)
+                    paste_records.append((src_path, dest_path))
+                    moved_count += 1
+                else:
+                    if os.path.isdir(src_path):
+                        shutil.copytree(src_path, dest_path)
+                    else:
+                        shutil.copy2(src_path, dest_path)
+                    paste_records.append((src_path, dest_path))
+                    copied_count += 1
+                    
+                    # 原地复制时，将新文件添加到 OrderManager
+                    if is_same_dir_copy:
+                        om = OrderManager(target_dir)
+                        om.add_image(os.path.basename(dest_path))
+            except Exception as e:
+                errors.append(f"{filename}: {e}")
+
+        # 记录到历史
+        if paste_records:
+            if self._clipboard_is_cut:
+                # 剪切粘贴：记录为移动操作
+                self.action_history.push(MoveRecord(paste_records))
+            else:
+                # 复制粘贴：记录为粘贴操作
+                self.action_history.push(PasteRecord(paste_records, is_cut=False))
+            self._update_undo_redo_buttons()
+
+        if self._clipboard_is_cut and paste_records:
+            # 检查受影响的源文件夹是否为空
+            for source_dir in affected_source_dirs:
+                if self._is_folder_empty_of_media(source_dir):
+                    # 源文件夹现在空了 → 清除缓存
+                    self.delegate.invalidate_cache(source_dir)
+                    self.folder_delegate.invalidate_cache(source_dir)
+                    self.folder_model.refresh_item(source_dir)
+                    self._clear_folder_order_records(source_dir)
+            
+            self._clipboard_paths = []
+            self.btn_paste.setEnabled(False)
+            self._clipboard_is_cut = False
+
+        # 刷新当前目录
+        cur = self.current_path
+        self.current_path = None
+        self._navigate_to(cur, use_async=False)
+        
+        # 智能刷新目标文件夹缩略图
+        if dest_was_empty and (moved_count > 0 or copied_count > 0):
+            # 目标文件夹之前是空的，现在有了文件 → 刷新缩略图
+            self.delegate.invalidate_cache(cur)
+            self.folder_delegate.invalidate_cache(cur)
+            self.folder_model.refresh_item(cur)
+
+        # 显示结果
+        if self._clipboard_is_cut:
+            op = "移动"
+            count = moved_count
+        else:
+            op = "复制"
+            count = copied_count
+        
+        if errors:
+            QMessageBox.warning(self, f"{op}出错", "\n".join(errors))
+        elif count > 0:
+            self.status.showMessage(f"已{op} {count} 个文件到当前目录")
+
     def _update_count(self):
         n_imgs = self.file_model.rowCount()
         n_dirs = self.folder_model.rowCount()
-        self.lbl_count.setText(f"{n_dirs} 个文件夹  {n_imgs} 张图片")
+        self.lbl_count.setText(f"{n_dirs} 个文件夹  {n_imgs} 个媒体文件")
+        
+        # 更新左侧空状态显示
+        if self.current_path:
+            if n_imgs == 0:
+                # 有当前路径但没有媒体文件
+                self.grid_view.setVisible(False)
+                self.empty_label.setVisible(False)
+                self.no_media_label.setVisible(True)
+            else:
+                # 有媒体文件
+                self.grid_view.setVisible(True)
+                self.empty_label.setVisible(False)
+                self.no_media_label.setVisible(False)
+        else:
+            # 没有打开文件夹
+            self.grid_view.setVisible(False)
+            self.empty_label.setVisible(True)
+            self.no_media_label.setVisible(False)
 
 
 # ─────────────────────────────────────────────
