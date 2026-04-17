@@ -23,9 +23,22 @@ from PyQt5.QtGui import *
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.ico'}
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v', '.mpg', '.mpeg', '.3gp', '.webm'}
 ALL_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS  # 合并图片和视频扩展名
+
 # 窗口布局持久化键名
 KEY_THUMB_SIZE = "thumb_size"
 KEY_SPLITTER_SIZES = "splitter_sizes"
+
+EMPTY_FOLDER_TEXT = (
+    "点击左上角「打开文件夹」选择媒体目录\n\n"
+    "支持图片: JPG / PNG / GIF / BMP / WebP\n"
+    "支持视频: MP4 / AVI / MOV / MKV / WebM"
+)
+
+NO_MEDIA_TEXT = (
+    "未发现媒体文件\n\n"
+    "支持的格式: JPG, PNG, GIF, BMP, WebP\n"
+    "MP4, AVI, MOV, MKV, WebM"
+)
 
 def normalize_path(path: str) -> str:
     """将路径中的正斜杠统一替换为反斜杠（Windows UNC 路径格式）"""
@@ -660,15 +673,159 @@ class ScannerThread(QThread):
         
         self.finished.emit()
 
+class BatchThumbnailLoader(QThread):
+    """批量加载缩略图线程（用于文件数 ≤ 500 时）"""
+    thumbnails_ready = pyqtSignal(list)  # 信号：[(path, pixmap), ...]
+
+    def __init__(self, items: list, size: int):
+        super().__init__()
+        self.items = items  # FileItem 列表
+        self.size = size
+
+    def run(self):
+        results = []
+        for item in self.items:
+            if item.is_dir:
+                continue  # 文件夹由 FolderThumbnailLoader 单独处理
+            
+            try:
+                if item.is_video():
+                    # 视频缩略图
+                    px = self._extract_video_thumbnail(item.path)
+                    if px is None:
+                        px = self._make_video_placeholder()
+                else:
+                    # 图片缩略图
+                    reader = QImageReader(item.path)
+                    reader.setAutoTransform(True)
+                    img = reader.read()
+                    if not img.isNull():
+                        scaled = img.scaled(
+                            self.size, self.size,
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation
+                        )
+                        px = QPixmap.fromImage(scaled)
+                    else:
+                        px = self._make_image_placeholder()
+                
+                if px:
+                    results.append((item.path, px))
+            except Exception:
+                pass
+        
+        self.thumbnails_ready.emit(results)
+    
+    def _extract_video_thumbnail(self, path: str) -> Optional[QPixmap]:
+        """提取视频中间帧作为缩略图"""
+        try:
+            import cv2
+            cap = cv2.VideoCapture(path)
+            if cap.isOpened():
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                
+                if total_frames > 0:
+                    mid_frame = total_frames // 5
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
+                    ret, frame = cap.read()
+                    
+                    if ret:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        h, w, ch = frame.shape
+                        bytes_per_line = ch * w
+                        qimage = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                        scaled = qimage.scaled(self.size, self.size,
+                                            Qt.KeepAspectRatio,
+                                            Qt.SmoothTransformation)
+                        cap.release()
+                        return QPixmap.fromImage(scaled)
+            cap.release()
+        except ImportError:
+            pass
+        
+        return None
+    
+    def _make_video_placeholder(self) -> QPixmap:
+        """创建视频文件占位图"""
+        s = self.size
+        px = QPixmap(s, s)
+        px.fill(Qt.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing)
+        
+        p.setBrush(QBrush(QColor(50, 50, 65)))
+        p.setPen(Qt.NoPen)
+        path = QPainterPath()
+        path.addRoundedRect(2, 2, s - 4, s - 4, 8, 8)
+        p.drawPath(path)
+        
+        p.setPen(QPen(QColor(100, 100, 120), 1.5))
+        film_x = s // 4
+        film_y = s // 3
+        film_w = s // 2
+        film_h = s // 3
+        p.drawRoundedRect(film_x, film_y, film_w, film_h, 4, 4)
+        
+        hole_size = max(2, s // 20)
+        for i in range(3):
+            p.drawEllipse(film_x + 5 + i * (film_w - 10) // 2, 
+                         film_y + 5, hole_size, hole_size)
+            p.drawEllipse(film_x + 5 + i * (film_w - 10) // 2,
+                         film_y + film_h - 8, hole_size, hole_size)
+        
+        p.setBrush(QBrush(QColor(200, 200, 220, 180)))
+        p.drawEllipse(s // 2 - 12, s // 2 - 12, 24, 24)
+        p.setBrush(QBrush(QColor(50, 50, 65)))
+        triangle = [
+            QPoint(s // 2 - 3, s // 2 - 6),
+            QPoint(s // 2 - 3, s // 2 + 6),
+            QPoint(s // 2 + 6, s // 2)
+        ]
+        p.drawPolygon(triangle)
+        
+        p.end()
+        return px
+    
+    def _make_image_placeholder(self) -> QPixmap:
+        """创建图片占位图"""
+        s = self.size
+        px = QPixmap(s, s)
+        px.fill(Qt.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QBrush(QColor(50, 50, 65)))
+        p.setPen(Qt.NoPen)
+        path = QPainterPath()
+        path.addRoundedRect(2, 2, s - 4, s - 4, 8, 8)
+        p.drawPath(path)
+        p.setPen(QPen(QColor(100, 100, 120), 1.5))
+        cx, cy = s // 2, s // 2
+        iw, ih = s // 3, s // 4
+        p.drawRoundedRect(cx - iw // 2, cy - ih // 2, iw, ih, 3, 3)
+        pts_l = [QPoint(cx - iw // 2, cy + ih // 2 - 2),
+                 QPoint(cx - iw // 8, cy),
+                 QPoint(cx + iw // 6, cy + ih // 4)]
+        pts_r = [QPoint(cx + iw // 6, cy + ih // 4),
+                 QPoint(cx + iw // 3, cy + ih // 8),
+                 QPoint(cx + iw // 2, cy + ih // 2 - 2)]
+        for pts in [pts_l, pts_r]:
+            for i in range(len(pts) - 1):
+                p.drawLine(pts[i], pts[i + 1])
+        p.drawEllipse(cx - iw // 4, cy - ih // 2 + 4, iw // 5, iw // 5)
+        p.end()
+        return px
+    
 class FileListModel(QAbstractListModel):
     ITEM_ROLE = Qt.UserRole + 1
     scan_finished = pyqtSignal()
     first_item_found = pyqtSignal()
+    all_thumbnails_loaded = pyqtSignal()  # 新增：所有缩略图加载完成信号
 
     def __init__(self):
         super().__init__()
         self.items: list[FileItem] = []
         self._scanner: Optional[ScannerThread] = None
+        self._batch_loader: Optional[BatchThumbnailLoader] = None
         self._first_item_emitted = False
 
     def rowCount(self, parent=QModelIndex()):
@@ -718,6 +875,10 @@ class FileListModel(QAbstractListModel):
             self._scanner.stop()
             self._scanner.wait()
             self._scanner = None
+        
+        if self._batch_loader and self._batch_loader.isRunning():
+            self._batch_loader.wait()
+            self._batch_loader = None
 
         # 2. 一次性清空并加载所有项目
         self.beginResetModel()
@@ -782,7 +943,7 @@ class FileListModel(QAbstractListModel):
         # 3. 创建并启动扫描线程
         self._scanner = ScannerThread(folder_path, dirs_only, files_only)
         self._scanner.item_found.connect(self._handle_item_found)
-        self._scanner.finished.connect(self.scan_finished.emit)
+        self._scanner.finished.connect(self._on_scan_finished_for_batch)
         self._scanner.start()
 
     # --- 流式加载核心逻辑 ---
@@ -812,6 +973,43 @@ class FileListModel(QAbstractListModel):
         if not self._first_item_emitted:
             self._first_item_emitted = True
             self.first_item_found.emit()
+
+    def _on_scan_finished_for_batch(self):
+        """扫描完成后，判断是否需要批量加载缩略图"""
+        self.scan_finished.emit()
+        
+        # 统计媒体文件数量（非文件夹）
+        media_count = sum(1 for item in self.items if not item.is_dir)
+        
+        if 0 < media_count <= 500:
+            # 文件数 ≤ 500，启动批量加载
+            media_items = [item for item in self.items if not item.is_dir]
+            if media_items:
+                self._batch_loader = BatchThumbnailLoader(media_items, MAX_THUMB_SIZE)
+                self._batch_loader.thumbnails_ready.connect(self._on_batch_thumbnails_ready)
+                self._batch_loader.start()
+        else:
+            # 文件数 > 500 或为 0，直接发射完成信号
+            self.all_thumbnails_loaded.emit()
+    
+    def _on_batch_thumbnails_ready(self, results: list):
+        """批量缩略图加载完成"""
+        # 将结果存入 items 的 thumbnail 属性
+        path_to_pixmap = {path: px for path, px in results}
+        
+        for item in self.items:
+            if not item.is_dir and item.path in path_to_pixmap:
+                item.thumbnail = path_to_pixmap[item.path]
+                item.loading = False
+        
+        # 通知视图刷新
+        self.all_thumbnails_loaded.emit()
+        
+        # 触发数据变更，让代理重新绘制
+        if self.items:
+            top_left = self.index(0)
+            bottom_right = self.index(len(self.items) - 1)
+            self.dataChanged.emit(top_left, bottom_right, [self.ITEM_ROLE])
 
     # --- 其他辅助方法 ---
 
@@ -1056,8 +1254,15 @@ class FileItemDelegate(QStyledItemDelegate):
         """获取媒体文件缩略图"""
         cache_key = f"media:{item.path}"
 
+        # 检查内存缓存
         if cache_key in self._thumb_cache:
             return self._scale_pixmap(self._thumb_cache[cache_key])
+        
+        # 检查 item 自带的 thumbnail（批量加载的结果）
+        if item.thumbnail is not None and not item.thumbnail.isNull():
+            # 存入缓存
+            self._thumb_cache[cache_key] = item.thumbnail
+            return self._scale_pixmap(item.thumbnail)
 
         if not item.loading:
             item.loading = True
@@ -1071,6 +1276,7 @@ class FileItemDelegate(QStyledItemDelegate):
             def on_ready(path, px):
                 self._thumb_cache[f"media:{path}"] = px
                 item.loading = False
+                item.thumbnail = px  # 同时存入 item
                 if index.isValid():
                     model = index.model()
                     if model:
@@ -1080,7 +1286,11 @@ class FileItemDelegate(QStyledItemDelegate):
             loader.start()
             self._loaders.append(loader)
 
-        return self._scale_pixmap(self._placeholder_image)
+        # 返回占位图
+        if item.is_video():
+            return self._scale_pixmap(self._placeholder_video)
+        else:
+            return self._scale_pixmap(self._placeholder_image)
 
     def _scale_pixmap(self, pixmap: QPixmap) -> QPixmap:
         """将高分辨率图片缩放到当前显示尺寸"""
@@ -1709,17 +1919,19 @@ class BreadcrumbBar(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.current_path: Optional[str] = None  # 当前路径
-        self.root_path: Optional[str] = None     # 根路径
+
+        self.current_path: Optional[str] = None   # 当前路径
+        self.root_path: Optional[str] = None      # 根路径
         self.history: list[str] = []             # 浏览历史
         self.action_history = ActionHistory()    # 文件移动撤销/重做历史
         self._clipboard_paths: list[str] = []    # 剪贴板文件路径
         self._clipboard_is_cut: bool = False     # True=剪切, False=复制
 
         self.setWindowTitle("PixClass")
-        self.setMinimumSize(900, 620)
-        # 启动时窗口最大化
-        self.showMaximized()
+        # 初始化阶段先隐藏窗口，避免半加载状态显示
+        self.setUpdatesEnabled(False)
+        self.hide()
+
         self._setup_ui()
         self._apply_global_style()
 
@@ -1727,7 +1939,17 @@ class MainWindow(QMainWindow):
         self.grid_view.installEventFilter(self)
         self.folder_view.installEventFilter(self)
 
-        QTimer.singleShot(100, self._load_last_session)
+        # 等事件循环启动后，再执行初始化并显示窗口
+        QTimer.singleShot(0, self._finish_startup)
+
+    def _finish_startup(self):
+        """UI全部构建完成后再显示主窗口"""
+        self._load_last_session()
+
+        self.setUpdatesEnabled(True)
+        self.showMaximized()
+        self.raise_()
+        self.activateWindow()
 
     def eventFilter(self, obj, event):
         """监听视图焦点变化，确保左右栏不同时选中"""
@@ -1968,10 +2190,33 @@ class MainWindow(QMainWindow):
         self.lbl_count.setStyleSheet(f"color: {TEXT_SECONDARY.name()}; font-size: 12px; padding: 0 8px;")
         toolbar.addWidget(self.lbl_count)
 
+        # ── 中央提示标签（没有打开文件夹时显示） ──
+        self.central_label_container = QWidget()
+        central_label_layout = QVBoxLayout(self.central_label_container)
+        central_label_layout.setContentsMargins(0, 0, 0, 0)
+        central_label_layout.setSpacing(0)
+        central_label_layout.addStretch()
+
+        self.central_label = QLabel(EMPTY_FOLDER_TEXT)
+        self.central_label.setAlignment(Qt.AlignCenter)
+        self.central_label.setWordWrap(True)
+        self.central_label.setStyleSheet(f"""
+            color: {TEXT_SECONDARY.name()};
+            font-size: 15px;
+            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            line-height: 2;
+            background: {BG_COLOR.name()};
+        """)
+        central_label_layout.addWidget(self.central_label)
+        central_label_layout.addStretch()
+
+        main_layout.addWidget(self.central_label_container)
+
         # ── 导航栏 ──
         self.breadcrumb = BreadcrumbBar()
         self.breadcrumb.path_selected.connect(self._navigate_to)
         self.breadcrumb.setFixedHeight(36)
+        self.breadcrumb.setVisible(False)  # 初始隐藏
         main_layout.addWidget(self.breadcrumb)
 
         # ── 左右分栏容器 ──
@@ -1983,6 +2228,7 @@ class MainWindow(QMainWindow):
                 width: 2px;
             }}
         """)
+        self.splitter.setVisible(False)  # 初始隐藏
         main_layout.addWidget(self.splitter, 1)
 
         # ── 左侧：图片网格 ──
@@ -1992,6 +2238,11 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
 
+        # 使用 QStackedWidget 来管理网格视图和空状态提示
+        self.left_stacked = QStackedWidget()
+        self.left_stacked.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        # 创建网格视图页面
         self.file_model = FileListModel()
         self.delegate = FileItemDelegate(self.file_model, DEFAULT_THUMB_SIZE)
         self.grid_view = ImageGridView(self.file_model, self.delegate)
@@ -2011,15 +2262,20 @@ class MainWindow(QMainWindow):
         self.file_model.rowsRemoved.connect(self._update_count)
         self.file_model.modelReset.connect(self._update_count)
         self.file_model.scan_finished.connect(self._on_file_scan_finished)
-        left_layout.addWidget(self.grid_view, 1)
 
-        # ── 空状态提示（放在左侧） ──
-        self.empty_label = QLabel(
-            "点击「打开文件夹」选择图片目录\n\n"
-            "支持图片: JPG / PNG / GIF / BMP / WebP\n"
-            "支持视频: MP4 / AVI / MOV / MKV / WebM"
-        )
+        # 创建空状态页面（带垂直居中的 label）
+        empty_page = QWidget()
+        empty_page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        empty_layout = QVBoxLayout(empty_page)
+        empty_layout.setContentsMargins(0, 0, 0, 0)
+        empty_layout.setSpacing(0)
+
+        empty_layout.addStretch()
+
+        self.empty_label = QLabel()
         self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setWordWrap(True)
         self.empty_label.setStyleSheet(f"""
             color: {TEXT_SECONDARY.name()};
             font-size: 15px;
@@ -2027,23 +2283,17 @@ class MainWindow(QMainWindow):
             line-height: 2;
             background: {BG_COLOR.name()};
         """)
-        left_layout.addWidget(self.empty_label)
+        self.empty_label.setText(EMPTY_FOLDER_TEXT)
+        empty_layout.addWidget(self.empty_label)
 
-        self.no_media_label = QLabel(
-            "未发现图片或视频\n\n"
-            "支持的格式: JPG, PNG, GIF, BMP, WebP\n"
-            "MP4, AVI, MOV, MKV, WebM"
-        )
-        self.no_media_label.setAlignment(Qt.AlignCenter)
-        self.no_media_label.setStyleSheet(f"""
-            color: {TEXT_SECONDARY.name()};
-            font-size: 15px;
-            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-            line-height: 2;
-            background: {BG_COLOR.name()};
-        """)
-        self.no_media_label.setVisible(False)
-        left_layout.addWidget(self.no_media_label)
+        empty_layout.addStretch()
+
+        # 添加到 stacked widget
+        self.left_stacked.addWidget(self.grid_view)  # index 0: 网格视图
+        self.left_stacked.addWidget(empty_page)      # index 1: 空状态页面
+
+        # 添加到布局，设置 stretch factor 为 1 使其占据所有剩余空间
+        left_layout.addWidget(self.left_stacked, 1)
 
         self.splitter.addWidget(left_widget)
 
@@ -2287,6 +2537,15 @@ class MainWindow(QMainWindow):
 
         self.current_path = path
 
+        # 断开之前的连接（如果有）
+        try:
+            self.file_model.all_thumbnails_loaded.disconnect()
+        except TypeError:
+            pass
+        
+        # 连接批量加载完成信号
+        self.file_model.all_thumbnails_loaded.connect(self._on_all_thumbnails_loaded)
+
         # ── 左侧：加载图片 ──
         if use_async:
             self.file_model.load_folder_async(path, dirs_only=False, files_only=True)
@@ -2305,17 +2564,17 @@ class MainWindow(QMainWindow):
             self.folder_model.load_folder_sync(path, dirs_only=True, files_only=False)
 
         self.btn_create_folder.setEnabled(True)
-
-        # 初始隐藏，等 _update_count 根据实际情况显示
-        self.empty_label.setVisible(False)
-        self.no_media_label.setVisible(False)
-
+        
         self.status.showMessage(f"当前目录: {path}")
-        self._update_count()
+        self._update_count()  
         self._update_undo_redo_buttons()
 
         if self.root_path:
             save_global_setting("last_root_path", self.root_path)
+
+    def _on_all_thumbnails_loaded(self):
+        """所有缩略图加载完成后刷新视图"""
+        self.grid_view.viewport().update()
 
     def _go_up(self):
         if self.current_path and self.root_path:
@@ -3380,24 +3639,24 @@ class MainWindow(QMainWindow):
         n_dirs = self.folder_model.rowCount()
         self.lbl_count.setText(f"{n_dirs} 个文件夹  {n_imgs} 个媒体文件")
         
-        # 更新左侧空状态显示
         if self.current_path:
+            # 有打开的文件夹：显示面包屑和分栏，隐藏中央标签
+            self.central_label_container.setVisible(False)
+            self.breadcrumb.setVisible(True)
+            self.splitter.setVisible(True)
+            
             if n_imgs == 0:
                 # 有当前路径但没有媒体文件
-                self.grid_view.setVisible(False)
-                self.empty_label.setVisible(False)
-                self.no_media_label.setVisible(True)
+                self.left_stacked.setCurrentIndex(1)
+                self.empty_label.setText(NO_MEDIA_TEXT)
             else:
                 # 有媒体文件
-                self.grid_view.setVisible(True)
-                self.empty_label.setVisible(False)
-                self.no_media_label.setVisible(False)
+                self.left_stacked.setCurrentIndex(0)
         else:
-            # 没有打开文件夹
-            self.grid_view.setVisible(False)
-            self.empty_label.setVisible(True)
-            self.no_media_label.setVisible(False)
-
+            # 没有打开文件夹：显示中央标签，隐藏面包屑和分栏
+            self.central_label_container.setVisible(True)
+            self.breadcrumb.setVisible(False)
+            self.splitter.setVisible(False)
 
 # ─────────────────────────────────────────────
 #  程序入口
