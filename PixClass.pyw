@@ -115,13 +115,15 @@ class ThumbnailLoader(QThread):
         self.size = size
 
     def run(self):
+        if self.isInterruptionRequested():
+            return
         try:
             # 使用 QImageReader 而不是 QImage，以便读取 EXIF 方向
             reader = QImageReader(self.path)
             reader.setAutoTransform(True)  # 关键：自动应用 EXIF 方向变换
             
             img = reader.read()
-            if not img.isNull():
+            if not img.isNull() and not self.isInterruptionRequested():
                 scaled = img.scaled(
                     self.size, self.size,
                     Qt.KeepAspectRatio,
@@ -141,14 +143,18 @@ class VideoThumbnailLoader(QThread):
         self.size = size
 
     def run(self):
+        if self.isInterruptionRequested():
+            return
         try:
             # 尝试提取视频缩略图
             thumbnail = self._extract_thumbnail()
-            self.thumbnail_ready.emit(self.path, thumbnail)
+            if not self.isInterruptionRequested():
+                self.thumbnail_ready.emit(self.path, thumbnail)
         except Exception as e:
             # 如果失败，使用默认占位图
-            placeholder = self._make_video_placeholder()
-            self.thumbnail_ready.emit(self.path, placeholder)
+            if not self.isInterruptionRequested():
+                placeholder = self._make_video_placeholder()
+                self.thumbnail_ready.emit(self.path, placeholder)
     
     def _extract_thumbnail(self) -> QPixmap:
         """提取视频中间帧作为缩略图"""
@@ -685,6 +691,9 @@ class BatchThumbnailLoader(QThread):
     def run(self):
         results = []
         for item in self.items:
+            # 支持外部中断（刷新/导航时安全退出）
+            if self.isInterruptionRequested():
+                break
             if item.is_dir:
                 continue  # 文件夹由 FolderThumbnailLoader 单独处理
             
@@ -873,11 +882,13 @@ class FileListModel(QAbstractListModel):
         # 1. 停止之前的扫描任务
         if self._scanner and self._scanner.isRunning():
             self._scanner.stop()
-            self._scanner.wait()
+            self._scanner.wait(2000)  # 最多等2秒，避免死锁
             self._scanner = None
-        
+
         if self._batch_loader and self._batch_loader.isRunning():
-            self._batch_loader.wait()
+            # 标记停止，不阻塞等待（等待会导致主线程死锁）
+            self._batch_loader.requestInterruption()
+            self._batch_loader.wait(500)  # 最多等500ms
             self._batch_loader = None
 
         # 2. 一次性清空并加载所有项目
@@ -1047,6 +1058,7 @@ class FileItemDelegate(QStyledItemDelegate):
         self._loaders: list[QThread] = []            # 所有加载线程列表
         self._loading_folders: set[str] = set()      # 正在加载封面的文件夹路径
         self._drop_target: Optional[str] = None      # 拖拽目标文件夹路径
+        self._MAX_CONCURRENT_LOADERS = 4             # 最大并发加载线程数，防止滚动卡顿
         
         # 固定使用最大尺寸生成所有占位图
         self._placeholder_folder = self._make_folder_icon_at_size(MAX_THUMB_SIZE)
@@ -1061,6 +1073,15 @@ class FileItemDelegate(QStyledItemDelegate):
 
     def _cleanup_loaders(self):
         self._loaders = [l for l in self._loaders if l.isRunning()]
+
+    def stop_all_loaders(self):
+        """停止所有正在运行的缩略图加载线程（刷新/导航时调用，防止卡死）"""
+        for loader in self._loaders:
+            if loader.isRunning():
+                loader.requestInterruption()
+        # 非阻塞：让线程自行退出，不等待，避免主线程卡死
+        self._loaders.clear()
+        self._loading_folders.clear()
 
     def set_drop_target(self, path: Optional[str]):
         self._drop_target = path
@@ -1265,6 +1286,15 @@ class FileItemDelegate(QStyledItemDelegate):
             return self._scale_pixmap(item.thumbnail)
 
         if not item.loading:
+            # 限制并发加载线程数，防止滚动时启动过多线程导致卡顿
+            active_count = sum(1 for l in self._loaders if l.isRunning())
+            if active_count >= self._MAX_CONCURRENT_LOADERS:
+                # 达到上限，返回占位图，等下次重绘时再尝试
+                if item.is_video():
+                    return self._scale_pixmap(self._placeholder_video)
+                else:
+                    return self._scale_pixmap(self._placeholder_image)
+
             item.loading = True
 
             # 始终按最大尺寸加载
@@ -1273,7 +1303,10 @@ class FileItemDelegate(QStyledItemDelegate):
             else:
                 loader = ThumbnailLoader(item.path, MAX_THUMB_SIZE)
 
-            def on_ready(path, px):
+            def on_ready(path, px, _loader=loader):
+                # 若该线程已被中断（刷新/导航触发），忽略结果
+                if _loader.isInterruptionRequested():
+                    return
                 self._thumb_cache[f"media:{path}"] = px
                 item.loading = False
                 item.thumbnail = px  # 同时存入 item
@@ -1519,10 +1552,50 @@ class ImageGridView(QListView):
         else:
             super().wheelEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        # 双击事件：进入文件夹/打开图片
+        index = self.indexAt(event.pos())
+        if index.isValid():
+            item: FileItem = index.data(FileListModel.ITEM_ROLE)
+            if item:
+                if item.is_dir:
+                    self.folder_entered.emit(item.path)
+                else:
+                    self.image_opened.emit(item.path)
+        super().mouseDoubleClickEvent(event)
+
+    def _is_blank_area(self, pos: QPoint) -> bool:
+        """判断坐标是否处于空白区域（图片与图片之间的间隔，或无图片的空白）"""
+        index = self.indexAt(pos)
+        return not index.isValid()
+
+    def _find_main_window(self):
+        """向上查找主窗口"""
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, MainWindow):
+                return parent
+            parent = parent.parent()
+        return None
+
     def mousePressEvent(self, event):
-        """鼠标点击时自动获取焦点"""
+        """鼠标点击时自动获取焦点，并处理侧键"""
         # 先设置焦点
         self.setFocus()
+        
+        # 处理鼠标侧键
+        if event.button() == Qt.XButton1:  # 侧键后退
+            main_win = self._find_main_window()
+            if main_win:
+                main_win._go_up()
+            event.accept()
+            return
+        elif event.button() == Qt.XButton2:  # 侧键前进
+            main_win = self._find_main_window()
+            if main_win:
+                main_win._go_history_back()
+            event.accept()
+            return
         
         if event.button() == Qt.LeftButton:
             if self._is_blank_area(event.pos()):
@@ -1544,43 +1617,6 @@ class ImageGridView(QListView):
                 super().mousePressEvent(event)
         else:
             super().mousePressEvent(event)
-
-    def mouseDoubleClickEvent(self, event):
-        # 双击事件：进入文件夹/打开图片
-        index = self.indexAt(event.pos())
-        if index.isValid():
-            item: FileItem = index.data(FileListModel.ITEM_ROLE)
-            if item:
-                if item.is_dir:
-                    self.folder_entered.emit(item.path)
-                else:
-                    self.image_opened.emit(item.path)
-        super().mouseDoubleClickEvent(event)
-
-    def _is_blank_area(self, pos: QPoint) -> bool:
-        """判断坐标是否处于空白区域（图片与图片之间的间隔，或无图片的空白）"""
-        index = self.indexAt(pos)
-        return not index.isValid()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            if self._is_blank_area(event.pos()):
-                # 点击空白区域：开始橡皮筋框选
-                self._rubber_origin = event.pos()
-                self._rubber_selecting = True
-                self._drag_start = None
-                if self._rubber_band is None:
-                    self._rubber_band = QRubberBand(QRubberBand.Rectangle, self.viewport())
-                self._rubber_band.setGeometry(QRect(self._rubber_origin, QSize()))
-                self._rubber_band.show()
-                # 清除已有选中（除非按住 Ctrl/Shift）
-                if not (event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)):
-                    self.clearSelection()
-            else:
-                # 点击了图片：记录拖拽起始
-                self._rubber_selecting = False
-                self._drag_start = event.pos()
-                super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         # 橡皮筋框选中
@@ -1938,6 +1974,7 @@ class MainWindow(QMainWindow):
         # 安装事件过滤器来监听焦点变化
         self.grid_view.installEventFilter(self)
         self.folder_view.installEventFilter(self)
+        self.installEventFilter(self) 
 
         # 等事件循环启动后，再执行初始化并显示窗口
         QTimer.singleShot(0, self._finish_startup)
@@ -1952,7 +1989,7 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def eventFilter(self, obj, event):
-        """监听视图焦点变化，确保左右栏不同时选中"""
+        """监听视图焦点变化、鼠标侧键"""
         if event.type() == QEvent.FocusIn:
             if obj == self.grid_view:
                 # 左侧获得焦点，清除右侧选中
@@ -1960,6 +1997,16 @@ class MainWindow(QMainWindow):
             elif obj == self.folder_view:
                 # 右侧获得焦点，清除左侧选中
                 self.grid_view.clearSelection()
+        
+        # 处理鼠标侧键
+        elif event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.XButton1:  # 侧键后退（通常是下方侧键）
+                self._go_up()
+                return True
+            elif event.button() == Qt.XButton2:  # 侧键前进（通常是上方侧键）
+                self._go_history_back()
+                return True
+        
         return super().eventFilter(obj, event)
     
     def _apply_global_style(self):
@@ -2593,6 +2640,10 @@ class MainWindow(QMainWindow):
     def _refresh(self):
         """刷新当前目录（同时更新 OrderManager 记录）"""
         if self.current_path:
+            # 先停止所有正在运行的缩略图加载线程，防止刷新时卡死
+            self.delegate.stop_all_loaders()
+            self.folder_delegate.stop_all_loaders()
+
             # 同步当前目录的 OrderManager 记录
             om = OrderManager(self.current_path)
             om.sync_with_filesystem()
