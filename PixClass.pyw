@@ -1272,44 +1272,28 @@ class FileItemDelegate(QStyledItemDelegate):
         return self._scale_pixmap(self._placeholder_folder)
 
     def _get_media_thumbnail(self, item: FileItem, index: QModelIndex) -> QPixmap:
-        """获取媒体文件缩略图"""
         cache_key = f"media:{item.path}"
-
-        # 检查内存缓存
         if cache_key in self._thumb_cache:
             return self._scale_pixmap(self._thumb_cache[cache_key])
         
-        # 检查 item 自带的 thumbnail（批量加载的结果）
         if item.thumbnail is not None and not item.thumbnail.isNull():
-            # 存入缓存
             self._thumb_cache[cache_key] = item.thumbnail
             return self._scale_pixmap(item.thumbnail)
 
         if not item.loading:
-            # 限制并发加载线程数，防止滚动时启动过多线程导致卡顿
-            active_count = sum(1 for l in self._loaders if l.isRunning())
-            if active_count >= self._MAX_CONCURRENT_LOADERS:
-                # 达到上限，返回占位图，等下次重绘时再尝试
-                if item.is_video():
-                    return self._scale_pixmap(self._placeholder_video)
-                else:
-                    return self._scale_pixmap(self._placeholder_image)
-
+            # 移除并发限制，直接启动加载线程
             item.loading = True
-
-            # 始终按最大尺寸加载
             if item.is_video():
                 loader = VideoThumbnailLoader(item.path, MAX_THUMB_SIZE)
             else:
                 loader = ThumbnailLoader(item.path, MAX_THUMB_SIZE)
 
             def on_ready(path, px, _loader=loader):
-                # 若该线程已被中断（刷新/导航触发），忽略结果
                 if _loader.isInterruptionRequested():
                     return
                 self._thumb_cache[f"media:{path}"] = px
                 item.loading = False
-                item.thumbnail = px  # 同时存入 item
+                item.thumbnail = px
                 if index.isValid():
                     model = index.model()
                     if model:
@@ -2293,6 +2277,7 @@ class MainWindow(QMainWindow):
         self.file_model = FileListModel()
         self.delegate = FileItemDelegate(self.file_model, DEFAULT_THUMB_SIZE)
         self.grid_view = ImageGridView(self.file_model, self.delegate)
+        self.delegate.setParent(self.grid_view) 
         self.grid_view.thumb_size_changed.connect(self._on_thumb_size_changed)
         cell = DEFAULT_THUMB_SIZE + 40
         self.grid_view.setGridSize(QSize(cell, cell))
@@ -2402,6 +2387,7 @@ class MainWindow(QMainWindow):
         self.folder_model = FileListModel()
         self.folder_delegate = FileItemDelegate(self.folder_model, DEFAULT_THUMB_SIZE)
         self.folder_view = ImageGridView(self.folder_model, self.folder_delegate)
+        self.folder_delegate.setParent(self.folder_view)
         self.folder_view.thumb_size_changed.connect(self._on_thumb_size_changed)
         self.folder_model.first_item_found.connect(self._on_folder_first_item)
         self.folder_model.scan_finished.connect(self._on_folder_scan_finished)
@@ -3713,15 +3699,14 @@ class MainWindow(QMainWindow):
 #  程序入口
 # ─────────────────────────────────────────────
 def main():
+    # 必须在 QApplication 实例化之前设置
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     app = QApplication(sys.argv)
     app.setApplicationName("PixClass")
-
-    # 开启高DPI适配
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
