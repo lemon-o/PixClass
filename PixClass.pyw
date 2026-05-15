@@ -669,8 +669,6 @@ class ScannerThread(QThread):
                         if item:
                             # 关键：通过信号发送给 Model
                             self.item_found.emit(item)
-                            # 极其微小的延迟可以让 UI 刷新更平滑，不至于瞬间阻塞主线程
-                            self.msleep(1) 
                             
                     except OSError:
                         continue
@@ -1425,6 +1423,7 @@ class ImageGridView(QListView):
     rename_requested = pyqtSignal(str)        # 重命名信号(路径)
     is_folder_panel: bool = False             # 标记是否为右侧文件夹面板
     thumb_size_changed = pyqtSignal(int)      # 缩略图大小变化信号
+    delete_requested = pyqtSignal(list)       # 删除信号(路径列表)
 
     def __init__(self, model: FileListModel, delegate: FileItemDelegate, parent=None):
         super().__init__(parent)
@@ -1835,6 +1834,10 @@ class ImageGridView(QListView):
                 menu.addSeparator()
                 act_rename = menu.addAction("✏  重命名\tF2")
                 act_rename.triggered.connect(lambda: self.rename_requested.emit(selected_paths[0]))
+            #删除菜单项
+            menu.addSeparator()
+            act_delete = menu.addAction("🗑  删除")
+            act_delete.triggered.connect(lambda: self.delete_requested.emit(selected_paths))
         else:
             # 空白处
             act_new = menu.addAction("📁  新建文件夹")
@@ -1946,6 +1949,7 @@ class MainWindow(QMainWindow):
         self.action_history = ActionHistory()    # 文件移动撤销/重做历史
         self._clipboard_paths: list[str] = []    # 剪贴板文件路径
         self._clipboard_is_cut: bool = False     # True=剪切, False=复制
+        self._last_selected: dict[str, str] = {}  # path -> 上次选中的 item.path
 
         self.setWindowTitle("PixClass")
         # 初始化阶段先隐藏窗口，避免半加载状态显示
@@ -2286,6 +2290,7 @@ class MainWindow(QMainWindow):
         self.grid_view.items_moved.connect(self._on_items_moved)
         self.grid_view.cut_requested.connect(self._on_cut)
         self.grid_view.copy_requested.connect(self._on_copy)
+        self.grid_view.delete_requested.connect(self._on_delete)
         self.grid_view.paste_requested.connect(self._paste_files)
         self.grid_view.new_folder_requested.connect(self._create_folder)
         self.grid_view.rename_requested.connect(self._rename_item)
@@ -2402,6 +2407,7 @@ class MainWindow(QMainWindow):
         self.folder_view.paste_requested.connect(self._paste_files)
         self.folder_view.new_folder_requested.connect(self._create_folder)
         self.folder_view.rename_requested.connect(self._rename_item)
+        self.folder_view.delete_requested.connect(self._on_delete)
         self.folder_view.is_folder_panel = True
         self.folder_view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.folder_view.setStyleSheet(f"""
@@ -2564,7 +2570,18 @@ class MainWindow(QMainWindow):
         if not os.path.exists(path):
             return
 
+        # 离开当前目录前，记录选中的 item
         if self.current_path and path != self.current_path:
+            sel = self.grid_view.selectedIndexes()
+            if sel:
+                item = sel[0].data(FileListModel.ITEM_ROLE)
+                if item:
+                    self._last_selected[self.current_path] = item.path
+            sel_f = self.folder_view.selectedIndexes()
+            if sel_f:
+                item_f = sel_f[0].data(FileListModel.ITEM_ROLE)
+                if item_f:
+                    self._last_selected[self.current_path] = item_f.path
             self.history.append(self.current_path)
             self.btn_hist_back.setEnabled(True)
 
@@ -2604,6 +2621,25 @@ class MainWindow(QMainWindow):
 
         if self.root_path:
             save_global_setting("last_root_path", self.root_path)
+
+        # 恢复上次在该目录的选中项
+        if path in self._last_selected:
+            target_path = self._last_selected[path]
+            # 在 file_model 中查找
+            for i, it in enumerate(self.file_model.items):
+                if it.path == target_path:
+                    idx = self.file_model.index(i)
+                    self.grid_view.setCurrentIndex(idx)
+                    self.grid_view.scrollTo(idx)
+                    break
+            else:
+                # 在 folder_model 中查找
+                for i, it in enumerate(self.folder_model.items):
+                    if it.path == target_path:
+                        idx = self.folder_model.index(i)
+                        self.folder_view.setCurrentIndex(idx)
+                        self.folder_view.scrollTo(idx)
+                        break
 
     def _on_all_thumbnails_loaded(self):
         """所有缩略图加载完成后刷新视图"""
@@ -2791,67 +2827,60 @@ class MainWindow(QMainWindow):
             subprocess.call(['xdg-open', path])
 
     def _on_items_moved(self, source_paths: list, dest_folder: str):
-        """处理图片拖拽移动"""
-        order_mgr = OrderManager(dest_folder)
-        moved_count = 0
-        errors = []
-        move_records: list[tuple[str, str]] = []
+        """处理图片拖拽移动：UI 立即响应，文件 IO 在后台线程执行"""
 
-        dest_was_empty = self._is_folder_empty_of_media(dest_folder)
+        # ── 1. 预计算目标路径（主线程，纯内存操作，极快）──
+        planned: list[tuple[str, str]] = []   # (src, dest)
+        seen_names: set[str] = set()
+
+        # 获取目标文件夹中已有的文件名（用于重名检测）
+        try:
+            existing_names = {e.name for e in os.scandir(dest_folder) if e.is_file()}
+        except OSError:
+            existing_names = set()
 
         for src_path in source_paths:
             filename = os.path.basename(src_path)
-            dest_path = os.path.join(dest_folder, filename)
+            base, ext = os.path.splitext(filename)
+            dest_name = filename
+            counter = 1
+            while dest_name in existing_names or dest_name in seen_names:
+                dest_name = f"{base}_{counter}{ext}"
+                counter += 1
+            seen_names.add(dest_name)
+            dest_path = os.path.join(dest_folder, dest_name)
+            planned.append((src_path, dest_path))
 
-            if os.path.exists(dest_path):
-                base, ext = os.path.splitext(filename)
-                counter = 1
-                while os.path.exists(dest_path):
-                    dest_path = os.path.join(dest_folder, f"{base}_{counter}{ext}")
-                    counter += 1
+        # ── 2. 立即更新 UI（不等文件实际移动）──
+        dest_was_empty = dest_folder not in {
+            normalize_path(os.path.abspath(dest_folder))
+        } or self._is_folder_empty_of_media(dest_folder)
+        # 重新用轻量方式判断（只看模型，不 scandir）
+        dest_was_empty = self.folder_model.rowCount() == 0 or self._is_folder_empty_of_media(dest_folder)
 
-            try:
-                shutil.move(src_path, dest_path)
-                new_filename = os.path.basename(dest_path)
-                order_mgr.add_image(new_filename)
-                
-                # 从源文件夹的 OrderManager 中移除记录
-                src_dir = os.path.dirname(src_path)
-                src_om = OrderManager(src_dir)
-                src_om.remove_image(filename)
-                
-                # 增量更新：直接从模型中移除
-                self.file_model.remove_item(src_path)
-                
-                move_records.append((src_path, dest_path))
-                moved_count += 1
-            except Exception as e:
-                errors.append(f"{filename}: {e}")
+        for src_path, dest_path in planned:
+            # 从左侧模型立即移除
+            self.file_model.remove_item(src_path)
+            # 更新 OrderManager 记录（纯内存，不涉及 IO）
+            src_dir = os.path.dirname(src_path)
+            src_om = OrderManager(src_dir)
+            src_om.remove_image(os.path.basename(src_path))
+            order_mgr = OrderManager(dest_folder)
+            order_mgr.add_image(os.path.basename(dest_path))
 
-        if move_records:
-            self.action_history.push(MoveRecord(move_records))
-            self._update_undo_redo_buttons()
-
-        # 智能刷新目标文件夹
-        if dest_was_empty and moved_count > 0:
+        # 刷新目标文件夹封面缓存
+        if planned:
             self.delegate.invalidate_cache(dest_folder)
             self.folder_delegate.invalidate_cache(dest_folder)
             self.folder_model.refresh_item(dest_folder)
-        
-        # 如果目标文件夹就是当前目录，添加移入的文件到模型
-        if dest_folder == self.current_path:
-            for src_path, dest_path in [(src, dst) for src, dst in zip(source_paths, 
-                                             [os.path.join(dest_folder, os.path.basename(src)) for src in source_paths])]:
-                if os.path.exists(dest_path):
-                    item = FileItem(dest_path, False)
-                    self._add_item_to_model(item)
 
-        # 检查源文件夹是否变空
-        source_dirs = set(os.path.dirname(src) for src in source_paths)
+        # 检查源文件夹是否"在模型上"已清空
+        source_dirs = set(os.path.dirname(src) for src, _ in planned)
         for src_dir in source_dirs:
-            if self._is_folder_empty_of_media(src_dir):
-                src_om = OrderManager(src_dir)
-                src_om.clear_records()
+            # 判断模型中是否还有该目录的文件（不 scandir）
+            remaining = [it for it in self.file_model.items
+                        if normalize_path(os.path.dirname(it.path)) == normalize_path(src_dir)]
+            if not remaining:
                 self.delegate.invalidate_cache(src_dir)
                 self.folder_delegate.invalidate_cache(src_dir)
                 self.folder_model.refresh_item(src_dir)
@@ -2859,12 +2888,58 @@ class MainWindow(QMainWindow):
         self._update_count()
         self.folder_view.viewport().update()
         self.grid_view.viewport().update()
+        self.status.showMessage(f"正在移动 {len(planned)} 个文件到 「{os.path.basename(dest_folder)}」…")
 
-        if errors:
-            QMessageBox.warning(self, "移动出错",
-                                "以下文件移动失败:\n" + "\n".join(errors))
+        # ── 3. 后台线程执行真正的文件 IO ──
+        move_thread = QThread()
+        # 把数据和逻辑封装进 worker
+        planned_copy = list(planned)
 
-        self.status.showMessage(f"已将 {moved_count} 个文件移入 「{os.path.basename(dest_folder)}」")
+        class _MoveWorker(QObject):
+            finished = pyqtSignal(list, list)   # (move_records, errors)
+
+            def __init__(self, jobs):
+                super().__init__()
+                self.jobs = jobs
+
+            def run(self):
+                records, errors = [], []
+                for src, dst in self.jobs:
+                    try:
+                        shutil.move(src, dst)
+                        records.append((src, dst))
+                    except Exception as e:
+                        errors.append(f"{os.path.basename(src)}: {e}")
+                self.finished.emit(records, errors)
+
+        worker = _MoveWorker(planned_copy)
+        worker.moveToThread(move_thread)
+
+        def _on_move_done(move_records, errors):
+            # 回到主线程：记录历史、显示最终状态
+            if move_records:
+                self.action_history.push(MoveRecord(move_records))
+                self._update_undo_redo_buttons()
+            if errors:
+                QMessageBox.warning(self, "移动出错",
+                                    "以下文件移动失败:\n" + "\n".join(errors))
+                # 移动失败的文件需要从 UI 恢复（重新加回模型）
+                for src, dst in planned_copy:
+                    if not os.path.exists(dst) and os.path.exists(src):
+                        item = FileItem(src, False)
+                        self._add_item_to_model(item)
+            moved_count = len(move_records)
+            self.status.showMessage(
+                f"已将 {moved_count} 个文件移入 「{os.path.basename(dest_folder)}」")
+            move_thread.quit()
+
+        worker.finished.connect(_on_move_done)
+        move_thread.started.connect(worker.run)
+        move_thread.start()
+
+        # 持有引用，防止被 GC
+        self._move_thread = move_thread
+        self._move_worker = worker
 
     def _is_folder_empty_of_media(self, folder_path: str) -> bool:
         """检查文件夹是否不包含任何媒体文件（图片或视频）"""
@@ -3514,6 +3589,52 @@ class MainWindow(QMainWindow):
         cur = self.current_path
         self.current_path = None
         self._navigate_to(cur, use_async=False)
+
+    def _on_delete(self, paths: list):
+        """删除选中的文件/文件夹（移至回收站或直接删除，询问确认）"""
+        if not paths:
+            return
+        
+        names = "\n".join(os.path.basename(p) for p in paths[:5])
+        if len(paths) > 5:
+            names += f"\n... 共 {len(paths)} 个"
+        
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要永久删除以下项目吗？\n\n{names}\n\n此操作不可撤销。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        errors = []
+        deleted = 0
+        for path in paths:
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                    self.folder_model.remove_item(path)
+                    self.delegate.invalidate_cache(path)
+                    self.folder_delegate.invalidate_cache(path)
+                else:
+                    parent_dir = os.path.dirname(path)
+                    om = OrderManager(parent_dir)
+                    om.remove_image(os.path.basename(path))
+                    os.remove(path)
+                    self.file_model.remove_item(path)
+                deleted += 1
+            except Exception as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+        
+        self._update_count()
+        self.folder_view.viewport().update()
+        self.grid_view.viewport().update()
+        
+        if errors:
+            QMessageBox.warning(self, "删除出错", "\n".join(errors))
+        else:
+            self.status.showMessage(f"已删除 {deleted} 个项目")
 
     def _on_cut(self, paths: list):
         if not paths:
